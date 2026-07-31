@@ -1,0 +1,191 @@
+// Command registry runs an OCI-compliant container registry with a token API
+// and a web management UI.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/kforbus3/container-registry/internal/api"
+	"github.com/kforbus3/container-registry/internal/auth"
+	"github.com/kforbus3/container-registry/internal/config"
+	"github.com/kforbus3/container-registry/internal/db"
+	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/sbom"
+	"github.com/kforbus3/container-registry/internal/store"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	slog.SetDefault(log)
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	database, err := db.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	st, err := store.New(cfg.DataDir, cfg.MaxUploadBytes)
+	if err != nil {
+		return err
+	}
+
+	if err := bootstrapAdmin(context.Background(), database, cfg, log); err != nil {
+		return err
+	}
+
+	collector := gc.New(database, st, log)
+	collector.Grace = cfg.GCGrace
+	collector.UploadTTL = cfg.GCUploadTTL
+
+	srv := api.NewServer(cfg, database, st, log)
+	srv.SetCollector(collector)
+
+	httpSrv := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: srv.Handler(),
+		// Blob uploads can be large and slow, so no global write timeout; the
+		// read header timeout still protects against slowloris connections.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ErrorLog:          slogErrorLog(log),
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Automatic SBOM generation. Workers run for the life of the process and
+	// drain on shutdown.
+	if cfg.SBOMEnabled {
+		generator := sbom.New(database, st, log, cfg.SBOMWorkers, cfg.SBOMQueueDepth)
+		generator.Start(ctx, cfg.SBOMWorkers)
+		srv.SetSBOMGenerator(generator)
+		defer generator.Wait()
+		log.Info("automatic SBOM generation enabled",
+			"workers", cfg.SBOMWorkers, "queue", cfg.SBOMQueueDepth)
+	}
+
+	go janitor(ctx, database, st, cfg.GCUploadTTL, log)
+
+	errCh := make(chan error, 1)
+	go func() {
+		scheme := "http"
+		if cfg.TLSEnabled() {
+			scheme = "https"
+		}
+		log.Info("registry listening",
+			"addr", cfg.Addr, "scheme", scheme, "data_dir", cfg.DataDir,
+			"anonymous_pull", cfg.AllowAnonymousPull)
+
+		var err error
+		if cfg.TLSEnabled() {
+			err = httpSrv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		log.Info("shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	return nil
+}
+
+func logLevel() slog.Level {
+	switch os.Getenv("REGISTRY_LOG_LEVEL") {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	}
+	return slog.LevelInfo
+}
+
+// bootstrapAdmin creates the first administrator when the database is empty.
+// The password comes from REGISTRY_ADMIN_PASSWORD, or is generated and printed
+// once so a fresh deployment is never left with a guessable default.
+func bootstrapAdmin(ctx context.Context, database *db.DB, cfg *config.Config, log *slog.Logger) error {
+	n, err := database.CountUsers(ctx)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	password := cfg.BootstrapPassword
+	generated := false
+	if password == "" {
+		if password, err = auth.NewSecret(18); err != nil {
+			return err
+		}
+		generated = true
+	}
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("bootstrap password rejected: %w", err)
+	}
+	if _, err := database.CreateUser(ctx, cfg.BootstrapUser, hash, "admin"); err != nil {
+		return fmt.Errorf("create bootstrap admin: %w", err)
+	}
+	if generated {
+		fmt.Printf("\n  Created administrator %q with a generated password:\n\n      %s\n\n"+
+			"  This is shown once. Set REGISTRY_ADMIN_PASSWORD to choose your own.\n\n",
+			cfg.BootstrapUser, password)
+	} else {
+		log.Info("created bootstrap administrator", "username", cfg.BootstrapUser)
+	}
+	return nil
+}
+
+// janitor periodically clears expired sessions and abandoned upload sessions.
+func janitor(ctx context.Context, database *db.DB, st *store.Store, uploadTTL time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := database.PurgeExpiredSessions(ctx); err != nil {
+				log.Warn("purge sessions failed", "err", err)
+			}
+			if n, err := st.PurgeStaleUploads(uploadTTL); err != nil {
+				log.Warn("purge uploads failed", "err", err)
+			} else if n > 0 {
+				log.Info("purged abandoned uploads", "count", n)
+			}
+		}
+	}
+}

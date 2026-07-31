@@ -1,0 +1,1059 @@
+package api
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/kforbus3/container-registry/internal/auth"
+	"github.com/kforbus3/container-registry/internal/db"
+	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/sbom"
+	"github.com/kforbus3/container-registry/internal/store"
+)
+
+// GC is set by main so the admin API can trigger collection.
+func (s *Server) SetCollector(c *gc.Collector) { s.collector = c }
+
+// SetSBOMGenerator wires in automatic SBOM generation. A nil generator simply
+// disables the feature.
+func (s *Server) SetSBOMGenerator(g *sbom.Generator) { s.sbom = g }
+
+// adminRouter serves the management API mounted at /api.
+func (s *Server) adminRouter() http.Handler {
+	mux := http.NewServeMux()
+
+	// Session endpoints are the only ones reachable without credentials.
+	mux.HandleFunc("POST /auth/login", s.handleLogin)
+	mux.HandleFunc("POST /auth/logout", s.handleLogout)
+	mux.Handle("GET /auth/me", s.requireAuth(s.handleMe))
+	mux.Handle("POST /auth/password", s.requireAuth(s.handleChangeOwnPassword))
+
+	mux.Handle("GET /stats", s.requireAuth(s.handleStats))
+	mux.Handle("GET /audit", s.requireAuth(s.handleAuditList))
+
+	mux.Handle("GET /tokens", s.requireAuth(s.handleTokensList))
+	mux.Handle("POST /tokens", s.requireAuth(s.handleTokenCreate))
+	mux.Handle("POST /tokens/{id}/revoke", s.requireAuth(s.handleTokenRevoke))
+	mux.Handle("DELETE /tokens/{id}", s.requireAuth(s.handleTokenDelete))
+
+	mux.Handle("GET /users", s.requireAdmin(s.handleUsersList))
+	mux.Handle("POST /users", s.requireAdmin(s.handleUserCreate))
+	mux.Handle("PATCH /users/{id}", s.requireAdmin(s.handleUserUpdate))
+	mux.Handle("DELETE /users/{id}", s.requireAdmin(s.handleUserDelete))
+
+	mux.Handle("GET /gc", s.requireAdmin(s.handleGCStatus))
+	mux.Handle("POST /gc", s.requireAdmin(s.handleGCRun))
+
+	mux.Handle("GET /settings", s.requireAdmin(s.handleSettingsGet))
+
+	// Repository paths contain slashes, so this subtree is routed by hand.
+	mux.Handle("/repositories", s.requireAuth(s.handleRepoList))
+	mux.Handle("/repositories/", s.requireAuth(s.handleRepoSubtree))
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "no such API endpoint")
+	})
+	return mux
+}
+
+// ---------------------------------------------------------------- middleware
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, err := s.resolvePrincipal(r)
+		if err != nil || p == nil {
+			writeErr(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		next(w, r.WithContext(withPrincipal(r.Context(), p)))
+	})
+}
+
+func (s *Server) requireAdmin(next http.HandlerFunc) http.Handler {
+	return s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if p := principalFrom(r.Context()); p == nil || !p.Admin {
+			writeErr(w, http.StatusForbidden, "administrator privileges required")
+			return
+		}
+		next(w, r)
+	})
+}
+
+func decodeJSON(r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("invalid request body: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- session
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p, err := s.Auth.AuthenticatePassword(r.Context(), req.Username, req.Password)
+	if err != nil {
+		s.DB.Audit(r.Context(), req.Username, "login.failed", "", "", err.Error(), remoteIP(r))
+		if errors.Is(err, auth.ErrDisabled) {
+			writeErr(w, http.StatusForbidden, "account is disabled")
+			return
+		}
+		writeErr(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	sid, err := auth.NewSessionID()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+	expires := time.Now().Add(s.Cfg.SessionTTL)
+	if err := s.DB.CreateSession(r.Context(), sid, p.UserID, expires); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+	s.DB.TouchUserLogin(r.Context(), p.UserID)
+	s.DB.Audit(r.Context(), p.Username, "login", "", "", "web ui", remoteIP(r))
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    sid,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   s.Cfg.TLSEnabled(),
+		SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, http.StatusOK, principalView(p))
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		s.DB.DeleteSession(r.Context(), c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: s.Cfg.TLSEnabled(), SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+type principalViewJSON struct {
+	Username    string `json:"username"`
+	Admin       bool   `json:"admin"`
+	ViaToken    bool   `json:"via_token"`
+	TokenName   string `json:"token_name,omitempty"`
+	CanPull     bool   `json:"can_pull"`
+	CanPush     bool   `json:"can_push"`
+	CanDelete   bool   `json:"can_delete"`
+	RepoPattern string `json:"repo_pattern"`
+}
+
+func principalView(p *auth.Principal) principalViewJSON {
+	return principalViewJSON{
+		Username: p.Username, Admin: p.Admin, ViaToken: p.TokenID != 0, TokenName: p.TokenName,
+		CanPull: p.CanPull, CanPush: p.CanPush, CanDelete: p.CanDelete, RepoPattern: p.RepoPattern,
+	}
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, principalView(principalFrom(r.Context())))
+}
+
+func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p := principalFrom(r.Context())
+	if p.TokenID != 0 {
+		writeErr(w, http.StatusForbidden, "password changes require an interactive login, not a token")
+		return
+	}
+	u, err := s.DB.GetUser(r.Context(), p.UserID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to load account")
+		return
+	}
+	if !auth.CheckPassword(u.PasswordHash, req.CurrentPassword) {
+		writeErr(w, http.StatusForbidden, "current password is incorrect")
+		return
+	}
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.DB.SetUserPassword(r.Context(), u.ID, hash); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to update password")
+		return
+	}
+	s.audit(r, "user.password_changed", "", u.Username, "self-service")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
+}
+
+// ---------------------------------------------------------------- stats & audit
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	st, err := s.DB.Stats(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to compute stats")
+		return
+	}
+	diskBytes, diskBlobs, _ := s.Store.DiskUsage()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repositories":     st.Repositories,
+		"tags":             st.Tags,
+		"manifests":        st.Manifests,
+		"blobs":            st.Blobs,
+		"users":            st.Users,
+		"active_tokens":    st.ActiveTokens,
+		"logical_bytes":    st.SizeBytes,
+		"disk_bytes":       diskBytes,
+		"disk_blob_count":  diskBlobs,
+		"anonymous_pull":   s.Cfg.AllowAnonymousPull,
+		"tls":              s.Cfg.TLSEnabled(),
+		"max_upload_bytes": s.Cfg.MaxUploadBytes,
+		"sbom":             s.sbomStats(),
+	})
+}
+
+// sbomStats reports generator activity, or nil when the feature is disabled.
+func (s *Server) sbomStats() any {
+	if s.sbom == nil {
+		return nil
+	}
+	st := s.sbom.Stats()
+	return map[string]any{
+		"enabled":   true,
+		"queued":    st.Queued,
+		"generated": st.Generated,
+		"skipped":   st.Skipped,
+		"failed":    st.Failed,
+		"dropped":   st.Dropped,
+	}
+}
+
+func (s *Server) handleAuditList(w http.ResponseWriter, r *http.Request) {
+	p := principalFrom(r.Context())
+	if !p.Admin {
+		writeErr(w, http.StatusForbidden, "administrator privileges required")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	entries, err := s.DB.ListAudit(r.Context(), r.URL.Query().Get("repo"), limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read audit log")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
+// ---------------------------------------------------------------- tokens
+
+func (s *Server) handleTokensList(w http.ResponseWriter, r *http.Request) {
+	p := principalFrom(r.Context())
+	// Non-admins see only their own tokens.
+	owner := p.UserID
+	if p.Admin && r.URL.Query().Get("all") == "true" {
+		owner = 0
+	}
+	tokens, err := s.DB.ListTokens(r.Context(), owner)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to list tokens")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": tokens})
+}
+
+type tokenCreateRequest struct {
+	Name        string `json:"name"`
+	CanPull     bool   `json:"can_pull"`
+	CanPush     bool   `json:"can_push"`
+	CanDelete   bool   `json:"can_delete"`
+	IsAdmin     bool   `json:"is_admin"`
+	RepoPattern string `json:"repo_pattern"`
+	ExpiresDays int    `json:"expires_days"`
+	// Username lets an admin mint a token on behalf of another account.
+	Username string `json:"username"`
+}
+
+func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
+	var req tokenCreateRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeErr(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if len(req.Name) > 100 {
+		writeErr(w, http.StatusBadRequest, "name must be at most 100 characters")
+		return
+	}
+	p := principalFrom(r.Context())
+	if p.TokenID != 0 && !p.Admin {
+		writeErr(w, http.StatusForbidden, "tokens cannot mint further tokens")
+		return
+	}
+
+	ownerID := p.UserID
+	if req.Username != "" {
+		if !p.Admin {
+			writeErr(w, http.StatusForbidden, "only administrators can create tokens for another user")
+			return
+		}
+		u, err := s.DB.GetUserByName(r.Context(), req.Username)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no such user")
+			return
+		}
+		ownerID = u.ID
+	}
+	if req.IsAdmin && !p.Admin {
+		writeErr(w, http.StatusForbidden, "only administrators can create admin tokens")
+		return
+	}
+	if !req.CanPull && !req.CanPush && !req.CanDelete && !req.IsAdmin {
+		writeErr(w, http.StatusBadRequest, "token must grant at least one permission")
+		return
+	}
+	pattern := strings.TrimSpace(req.RepoPattern)
+	if pattern == "" {
+		pattern = "*"
+	}
+	// A non-admin cannot widen scope beyond what they can already reach; today
+	// users hold full rights, so this only guards against a malformed pattern.
+	if len(pattern) > 500 {
+		writeErr(w, http.StatusBadRequest, "repo_pattern is too long")
+		return
+	}
+
+	plaintext, prefix, hash, err := auth.GenerateToken()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	t := &db.Token{
+		Name: req.Name, UserID: ownerID, Prefix: prefix, SecretHash: hash,
+		CanPull: req.CanPull, CanPush: req.CanPush, CanDelete: req.CanDelete,
+		IsAdmin: req.IsAdmin, RepoPattern: pattern,
+	}
+	if req.ExpiresDays > 0 {
+		exp := time.Now().Add(time.Duration(req.ExpiresDays) * 24 * time.Hour)
+		t.ExpiresAt = &exp
+	}
+	created, err := s.DB.CreateToken(r.Context(), t)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to store token")
+		return
+	}
+	s.audit(r, "token.create", "", req.Name, "scope="+pattern)
+
+	// The plaintext is returned exactly once and never stored.
+	writeJSON(w, http.StatusCreated, map[string]any{"token": created, "secret": plaintext})
+}
+
+// tokenByID loads a token and enforces that the caller may manage it.
+func (s *Server) tokenByID(w http.ResponseWriter, r *http.Request) (*db.Token, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid token id")
+		return nil, false
+	}
+	t, err := s.DB.GetToken(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such token")
+		return nil, false
+	}
+	p := principalFrom(r.Context())
+	if !p.Admin && t.UserID != p.UserID {
+		writeErr(w, http.StatusForbidden, "this token belongs to another user")
+		return nil, false
+	}
+	return t, true
+}
+
+func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.tokenByID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.DB.RevokeToken(r.Context(), t.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to revoke token")
+		return
+	}
+	s.audit(r, "token.revoke", "", t.Name, "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+func (s *Server) handleTokenDelete(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.tokenByID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.DB.DeleteToken(r.Context(), t.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to delete token")
+		return
+	}
+	s.audit(r, "token.delete", "", t.Name, "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ---------------------------------------------------------------- users
+
+func (s *Server) handleUsersList(w http.ResponseWriter, r *http.Request) {
+	users, err := s.DB.ListUsers(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to list users")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+}
+
+func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Username = strings.TrimSpace(strings.ToLower(req.Username))
+	if !validUsername(req.Username) {
+		writeErr(w, http.StatusBadRequest, "username must be 2-64 characters of letters, digits, '.', '_' or '-'")
+		return
+	}
+	if req.Role != "admin" {
+		req.Role = "user"
+	}
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.DB.GetUserByName(r.Context(), req.Username); err == nil {
+		writeErr(w, http.StatusConflict, "a user with that name already exists")
+		return
+	}
+	u, err := s.DB.CreateUser(r.Context(), req.Username, hash, req.Role)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+	s.audit(r, "user.create", "", u.Username, "role="+u.Role)
+	writeJSON(w, http.StatusCreated, u)
+}
+
+func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	var req struct {
+		Role     *string `json:"role"`
+		Disabled *bool   `json:"disabled"`
+		Password *string `json:"password"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	u, err := s.DB.GetUser(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such user")
+		return
+	}
+
+	// Refuse any change that would leave the registry with no usable admin.
+	losingAdmin := (req.Role != nil && *req.Role != "admin" && u.IsAdmin()) ||
+		(req.Disabled != nil && *req.Disabled && u.IsAdmin() && !u.Disabled)
+	if losingAdmin {
+		n, err := s.DB.CountAdmins(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to count administrators")
+			return
+		}
+		if n <= 1 {
+			writeErr(w, http.StatusConflict, "cannot remove the last administrator")
+			return
+		}
+	}
+
+	if req.Role != nil {
+		role := *req.Role
+		if role != "admin" && role != "user" {
+			writeErr(w, http.StatusBadRequest, "role must be 'admin' or 'user'")
+			return
+		}
+		if err := s.DB.SetUserRole(r.Context(), id, role); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to update role")
+			return
+		}
+		s.audit(r, "user.role_changed", "", u.Username, role)
+	}
+	if req.Disabled != nil {
+		if err := s.DB.SetUserDisabled(r.Context(), id, *req.Disabled); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to update account state")
+			return
+		}
+		s.audit(r, "user.disabled_changed", "", u.Username, strconv.FormatBool(*req.Disabled))
+	}
+	if req.Password != nil {
+		hash, err := auth.HashPassword(*req.Password)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.DB.SetUserPassword(r.Context(), id, hash); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to update password")
+			return
+		}
+		// Force re-authentication everywhere after an administrative reset.
+		s.DB.ExecContext(r.Context(), `DELETE FROM sessions WHERE user_id = ?`, id)
+		s.audit(r, "user.password_reset", "", u.Username, "by administrator")
+	}
+
+	updated, err := s.DB.GetUser(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to reload user")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	p := principalFrom(r.Context())
+	if p.UserID == id {
+		writeErr(w, http.StatusConflict, "you cannot delete your own account")
+		return
+	}
+	u, err := s.DB.GetUser(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such user")
+		return
+	}
+	if u.IsAdmin() && !u.Disabled {
+		n, err := s.DB.CountAdmins(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to count administrators")
+			return
+		}
+		if n <= 1 {
+			writeErr(w, http.StatusConflict, "cannot delete the last administrator")
+			return
+		}
+	}
+	if err := s.DB.DeleteUser(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
+	s.audit(r, "user.delete", "", u.Username, "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func validUsername(s string) bool {
+	if len(s) < 2 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------- gc & settings
+
+func (s *Server) handleGCStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"running": s.collector.Running(),
+		"last":    s.collector.Last(),
+	})
+}
+
+func (s *Server) handleGCRun(w http.ResponseWriter, r *http.Request) {
+	dryRun := r.URL.Query().Get("dry_run") == "true"
+	res, err := s.collector.Run(r.Context(), dryRun)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.audit(r, "gc.run", "", "", fmt.Sprintf("dry_run=%v deleted=%d reclaimed=%d",
+		dryRun, res.BlobsDeleted, res.BytesReclaimed))
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"addr":             s.Cfg.Addr,
+		"data_dir":         s.Cfg.DataDir,
+		"realm":            s.Cfg.Realm,
+		"tls":              s.Cfg.TLSEnabled(),
+		"anonymous_pull":   s.Cfg.AllowAnonymousPull,
+		"max_upload_bytes": s.Cfg.MaxUploadBytes,
+		"session_ttl":      s.Cfg.SessionTTL.String(),
+		"storage_root":     s.Store.Root(),
+		"gc_grace":         s.collector.Grace.String(),
+		"gc_upload_ttl":    s.collector.UploadTTL.String(),
+	})
+}
+
+// ---------------------------------------------------------------- repositories
+
+func (s *Server) handleRepoList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	p := principalFrom(r.Context())
+	repos, err := s.DB.ListRepositories(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to list repositories")
+		return
+	}
+	visible := make([]*db.Repository, 0, len(repos))
+	for _, repo := range repos {
+		if p.CanPullRepo(repo.Name) || repo.Public {
+			visible = append(visible, repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repositories": visible})
+}
+
+// handleRepoSubtree routes /repositories/<name>[/tags[/<tag>]|/manifests/<digest>],
+// where <name> may itself contain slashes.
+func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/repositories/")
+	rest = strings.TrimSuffix(rest, "/")
+	if rest == "" {
+		writeErr(w, http.StatusBadRequest, "repository name is required")
+		return
+	}
+	segments := strings.Split(rest, "/")
+
+	verbIdx := -1
+	for i := len(segments) - 1; i > 0; i-- {
+		if segments[i] == "tags" || segments[i] == "manifests" {
+			verbIdx = i
+			break
+		}
+	}
+	name := rest
+	var tail []string
+	if verbIdx > 0 {
+		name = strings.Join(segments[:verbIdx], "/")
+		tail = segments[verbIdx:]
+	}
+
+	unescaped, err := unescapePath(name)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid repository name")
+		return
+	}
+	name = unescaped
+	if !validRepoName(name) {
+		writeErr(w, http.StatusBadRequest, "invalid repository name")
+		return
+	}
+
+	repo, err := s.DB.GetRepository(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such repository")
+		return
+	}
+	p := principalFrom(r.Context())
+	if !p.CanPullRepo(name) && !repo.Public {
+		writeErr(w, http.StatusForbidden, "you do not have access to this repository")
+		return
+	}
+
+	switch {
+	case len(tail) == 0:
+		s.repoRoot(w, r, repo)
+	case len(tail) == 1 && tail[0] == "tags":
+		s.repoTags(w, r, repo)
+	case len(tail) == 2 && tail[0] == "tags":
+		s.repoTag(w, r, repo, tail[1])
+	case len(tail) == 3 && tail[0] == "manifests" && tail[2] == "sbom":
+		s.repoSBOM(w, r, repo, tail[1])
+	case len(tail) == 2 && tail[0] == "manifests":
+		s.repoManifest(w, r, repo, tail[1])
+	default:
+		writeErr(w, http.StatusNotFound, "no such API endpoint")
+	}
+}
+
+func unescapePath(s string) (string, error) {
+	// Path segments arrive already decoded by net/http for the most part, but
+	// a name pushed with %2F needs one more pass.
+	if !strings.Contains(s, "%") {
+		return s, nil
+	}
+	out, err := urlPathUnescape(s)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	p := principalFrom(r.Context())
+	switch r.Method {
+	case http.MethodGet:
+		tags, err := s.DB.ListTagsDetailed(r.Context(), repo.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to list tags")
+			return
+		}
+		manifests, err := s.DB.ListManifests(r.Context(), repo.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to list manifests")
+			return
+		}
+		tagged := map[string]bool{}
+		for _, t := range tags {
+			tagged[t.Digest] = true
+		}
+		// A manifest with a subject is a referrer — an SBOM, signature or
+		// attestation. It carries no tag by design and is reachable through the
+		// manifest it describes, so it is not garbage. Only genuinely
+		// unreferenced manifests belong in the reclaimable list.
+		untagged := []*db.Manifest{}
+		referrers := []*db.Manifest{}
+		for _, m := range manifests {
+			switch {
+			case m.Subject != "":
+				referrers = append(referrers, m)
+			case !tagged[m.Digest]:
+				untagged = append(untagged, m)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"repository":         repo,
+			"tags":               tags,
+			"manifests":          manifests,
+			"untagged_manifests": untagged,
+			"referrer_manifests": referrers,
+		})
+
+	case http.MethodPatch:
+		if !p.Admin && !p.CanPushRepo(repo.Name) {
+			writeErr(w, http.StatusForbidden, "push permission is required to configure a repository")
+			return
+		}
+		var req struct {
+			Public      *bool   `json:"public"`
+			Immutable   *bool   `json:"immutable"`
+			Description *string `json:"description"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		public, immutable, desc := repo.Public, repo.Immutable, repo.Description
+		if req.Public != nil {
+			public = *req.Public
+		}
+		if req.Immutable != nil {
+			immutable = *req.Immutable
+		}
+		if req.Description != nil {
+			desc = *req.Description
+			if len(desc) > 1000 {
+				writeErr(w, http.StatusBadRequest, "description must be at most 1000 characters")
+				return
+			}
+		}
+		if err := s.DB.UpdateRepository(r.Context(), repo.ID, public, immutable, desc); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to update repository")
+			return
+		}
+		s.audit(r, "repo.update", repo.Name, "",
+			fmt.Sprintf("public=%v immutable=%v", public, immutable))
+		updated, _ := s.DB.GetRepository(r.Context(), repo.Name)
+		writeJSON(w, http.StatusOK, updated)
+
+	case http.MethodDelete:
+		if !p.CanDeleteRepo(repo.Name) {
+			writeErr(w, http.StatusForbidden, "delete permission is required")
+			return
+		}
+		if err := s.DB.DeleteRepository(r.Context(), repo.ID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to delete repository")
+			return
+		}
+		s.audit(r, "repo.delete", repo.Name, "", "")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) repoTags(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	switch r.Method {
+	case http.MethodGet:
+		tags, err := s.DB.ListTagsDetailed(r.Context(), repo.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to list tags")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tags": tags})
+
+	case http.MethodPost:
+		s.createTag(w, r, repo)
+
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// createTag points a new tag at an existing manifest, identified either by
+// digest or by an existing tag. This is the API-driven retag operation.
+func (s *Server) createTag(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	p := principalFrom(r.Context())
+	if !p.CanPushRepo(repo.Name) {
+		writeErr(w, http.StatusForbidden, "push permission is required to create a tag")
+		return
+	}
+	var req struct {
+		Tag string `json:"tag"`
+		// Target is a manifest digest or an existing tag in this repository.
+		Target string `json:"target"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Tag, req.Target = strings.TrimSpace(req.Tag), strings.TrimSpace(req.Target)
+	if !validTag(req.Tag) {
+		writeErr(w, http.StatusBadRequest, "invalid tag name")
+		return
+	}
+	if req.Target == "" {
+		writeErr(w, http.StatusBadRequest, "target is required (a manifest digest or an existing tag)")
+		return
+	}
+
+	digest := req.Target
+	if !store.ValidDigest(digest) {
+		t, err := s.DB.GetTag(r.Context(), repo.ID, req.Target)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "target tag does not exist in this repository")
+			return
+		}
+		digest = t.Digest
+	}
+	if _, err := s.DB.GetManifest(r.Context(), repo.ID, digest); err != nil {
+		writeErr(w, http.StatusNotFound, "target manifest does not exist in this repository")
+		return
+	}
+	if repo.Immutable {
+		if existing, err := s.DB.GetTag(r.Context(), repo.ID, req.Tag); err == nil && existing.Digest != digest {
+			writeErr(w, http.StatusConflict, "repository is immutable and this tag already exists")
+			return
+		}
+	}
+	if err := s.DB.PutTag(r.Context(), repo.ID, req.Tag, digest); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create tag")
+		return
+	}
+	s.audit(r, "tag.create", repo.Name, req.Tag, digest)
+	writeJSON(w, http.StatusCreated, map[string]string{"tag": req.Tag, "digest": digest})
+}
+
+func (s *Server) repoTag(w http.ResponseWriter, r *http.Request, repo *db.Repository, tag string) {
+	p := principalFrom(r.Context())
+	switch r.Method {
+	case http.MethodGet:
+		t, err := s.DB.GetTag(r.Context(), repo.ID, tag)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no such tag")
+			return
+		}
+		writeJSON(w, http.StatusOK, t)
+
+	case http.MethodDelete:
+		if !p.CanDeleteRepo(repo.Name) {
+			writeErr(w, http.StatusForbidden, "delete permission is required")
+			return
+		}
+		if _, err := s.DB.GetTag(r.Context(), repo.ID, tag); err != nil {
+			writeErr(w, http.StatusNotFound, "no such tag")
+			return
+		}
+		if err := s.DB.DeleteTag(r.Context(), repo.ID, tag); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to delete tag")
+			return
+		}
+		s.audit(r, "tag.delete", repo.Name, tag, "")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// repoManifest returns a manifest with its parsed content and, for image
+// manifests, the decoded image config.
+func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.Repository, digest string) {
+	p := principalFrom(r.Context())
+	if !store.ValidDigest(digest) {
+		writeErr(w, http.StatusBadRequest, "invalid digest")
+		return
+	}
+	m, err := s.DB.GetManifest(r.Context(), repo.ID, digest)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such manifest")
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		if !p.CanDeleteRepo(repo.Name) {
+			writeErr(w, http.StatusForbidden, "delete permission is required")
+			return
+		}
+		if err := s.DB.DeleteManifest(r.Context(), repo.ID, digest); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to delete manifest")
+			return
+		}
+		s.audit(r, "manifest.delete", repo.Name, digest, "")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	refs, err := s.DB.ManifestRefs(r.Context(), m.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to load manifest references")
+		return
+	}
+	tags, _ := s.DB.TagsForDigest(r.Context(), repo.ID, digest)
+
+	resp := map[string]any{"manifest": m, "refs": refs, "tags": tags}
+	if body, err := s.Store.ReadAll(digest); err == nil {
+		var raw any
+		if json.Unmarshal(body, &raw) == nil {
+			resp["content"] = raw
+		}
+	}
+	// Decode the image config so the UI can show entrypoint, env and history.
+	if m.ConfigDigest != "" {
+		if cfgBody, err := s.Store.ReadAll(m.ConfigDigest); err == nil && len(cfgBody) < (2<<20) {
+			var cfg imageConfig
+			if json.Unmarshal(cfgBody, &cfg) == nil {
+				resp["config"] = cfg
+			}
+		}
+	}
+	var totalSize int64
+	for _, ref := range refs {
+		totalSize += ref.Size
+	}
+	resp["total_size"] = totalSize
+
+	// Surface an automatically generated SBOM, if one has been published for
+	// this manifest, so the UI can link to it without a second round trip.
+	if sboms, err := s.DB.Referrers(r.Context(), repo.ID, digest, sbom.MediaType); err == nil && len(sboms) > 0 {
+		summary := map[string]any{"digest": sboms[0].Digest, "artifact_type": sboms[0].ArtifactType}
+		if body, err := s.Store.ReadAll(sboms[0].Digest); err == nil {
+			var art struct {
+				Annotations map[string]string `json:"annotations"`
+			}
+			if json.Unmarshal(body, &art) == nil {
+				if n, ok := art.Annotations["registry.sbom.componentCount"]; ok {
+					summary["component_count"] = n
+				}
+				if ts, ok := art.Annotations["org.opencontainers.image.created"]; ok {
+					summary["created"] = ts
+				}
+			}
+		}
+		resp["sbom"] = summary
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// repoSBOM serves the CycloneDX document generated for a manifest. The SBOM is
+// also reachable through the standard referrers API; this endpoint just saves
+// callers the two extra round trips.
+func (s *Server) repoSBOM(w http.ResponseWriter, r *http.Request, repo *db.Repository, digest string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !store.ValidDigest(digest) {
+		writeErr(w, http.StatusBadRequest, "invalid digest")
+		return
+	}
+	sboms, err := s.DB.Referrers(r.Context(), repo.ID, digest, sbom.MediaType)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to look up SBOM")
+		return
+	}
+	if len(sboms) == 0 {
+		writeErr(w, http.StatusNotFound,
+			"no SBOM has been generated for this manifest yet")
+		return
+	}
+
+	// The artifact manifest carries the document as its single layer.
+	artBody, err := s.Store.ReadAll(sboms[0].Digest)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "SBOM artifact is missing from storage")
+		return
+	}
+	var art struct {
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+	}
+	if err := json.Unmarshal(artBody, &art); err != nil || len(art.Layers) == 0 {
+		writeErr(w, http.StatusInternalServerError, "malformed SBOM artifact")
+		return
+	}
+	doc, err := s.Store.ReadAll(art.Layers[0].Digest)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "SBOM document is missing from storage")
+		return
+	}
+	w.Header().Set("Content-Type", sbom.MediaType)
+	w.Header().Set("Content-Disposition", `attachment; filename="sbom.cdx.json"`)
+	w.WriteHeader(http.StatusOK)
+	w.Write(doc)
+}

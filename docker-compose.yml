@@ -1,0 +1,33 @@
+services:
+  registry:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: container-registry:latest
+    container_name: container-registry
+    restart: unless-stopped
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+    environment:
+      # Set this before the first start to choose the initial admin password.
+      # Leave it unset and the generated password is printed once to the log.
+      REGISTRY_ADMIN_PASSWORD: ${REGISTRY_ADMIN_PASSWORD:-}
+      REGISTRY_ADMIN_USER: ${REGISTRY_ADMIN_USER:-admin}
+      REGISTRY_ANONYMOUS_PULL: ${REGISTRY_ANONYMOUS_PULL:-false}
+      REGISTRY_LOG_LEVEL: ${REGISTRY_LOG_LEVEL:-info}
+      # Uncomment and mount certificates to serve HTTPS directly.
+      # REGISTRY_TLS_CERT: /certs/tls.crt
+      # REGISTRY_TLS_KEY: /certs/tls.key
+    volumes:
+      - registry-data:/var/lib/registry
+      # - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  registry-data:

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Container Registry</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📦</text></svg>">
+</head>
+<body>
+
+<div id="login" class="login-screen" hidden>
+  <form class="login-card" id="login-form">
+    <div class="login-mark">📦</div>
+    <h1>Container Registry</h1>
+    <p class="muted">Sign in to manage repositories, tokens and users.</p>
+    <label for="login-user">Username</label>
+    <input id="login-user" name="username" autocomplete="username" required autofocus>
+    <label for="login-pass">Password</label>
+    <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit" class="btn primary block">Sign in</button>
+    <div class="form-error" id="login-error" role="alert" hidden></div>
+  </form>
+</div>
+
+<div id="app" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">📦</span><span>Registry</span></div>
+    <nav id="nav">
+      <a href="#/overview"     data-nav="overview">Overview</a>
+      <a href="#/repositories" data-nav="repositories">Repositories</a>
+      <a href="#/tokens"       data-nav="tokens">API Tokens</a>
+      <a href="#/users"        data-nav="users" data-admin>Users</a>
+      <a href="#/audit"        data-nav="audit" data-admin>Audit Log</a>
+      <a href="#/maintenance"  data-nav="maintenance" data-admin>Maintenance</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="who"><span id="who-name"></span><span class="badge" id="who-role"></span></div>
+      <button class="btn ghost small block" id="btn-password">Change password</button>
+      <button class="btn ghost small block" id="btn-logout">Sign out</button>
+    </div>
+  </aside>
+
+  <main id="view" class="view"><div class="loading">Loading…</div></main>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<dialog id="modal" class="modal">
+  <form method="dialog" id="modal-form">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <menu class="modal-actions">
+      <button value="cancel" class="btn ghost" type="submit" id="modal-cancel">Cancel</button>
+      <button value="ok" class="btn primary" id="modal-ok" type="submit">Confirm</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
