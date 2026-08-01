@@ -222,11 +222,7 @@ func (g *Generator) Generate(ctx context.Context, job Job) (bool, error) {
 	}
 
 	layers := make([]LayerSource, 0, len(m.Layers))
-	skippedZstd := 0
 	for _, l := range m.Layers {
-		if strings.HasSuffix(l.MediaType, "+zstd") {
-			skippedZstd++
-		}
 		src := LayerSource{Digest: l.Digest, MediaType: l.MediaType}
 		src.Open = func() (io.ReadCloser, error) {
 			f, _, err := g.Store.Open(src.Digest)
@@ -240,7 +236,7 @@ func (g *Generator) Generate(ctx context.Context, job Job) (bool, error) {
 		return false, fmt.Errorf("scan layers: %w", err)
 	}
 
-	doc := g.document(job, &m, scan, skippedZstd)
+	doc := g.document(job, &m, scan)
 	body, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return false, fmt.Errorf("encode sbom: %w", err)
@@ -315,7 +311,7 @@ func (g *Generator) hasSBOM(ctx context.Context, job Job) (bool, error) {
 	return len(existing) > 0, nil
 }
 
-func (g *Generator) document(job Job, m *imageManifest, scan *Result, skippedZstd int) *Document {
+func (g *Generator) document(job Job, m *imageManifest, scan *Result) *Document {
 	distro := scan.Distro
 	components := toComponents(scan.Packages, distro)
 
@@ -333,14 +329,6 @@ func (g *Generator) document(job Job, m *imageManifest, scan *Result, skippedZst
 		Property{Name: "registry:manifestDigest", Value: job.Digest},
 		Property{Name: "registry:layerCount", Value: fmt.Sprint(len(m.Layers))},
 	)
-	if skippedZstd > 0 {
-		// Recorded rather than hidden: a partial scan must be visible in the
-		// document itself, not just in the server log.
-		image.Properties = append(image.Properties, Property{
-			Name:  "registry:skippedLayers",
-			Value: fmt.Sprintf("%d zstd-compressed layer(s) were not scanned", skippedZstd),
-		})
-	}
 	if scan.ManifestsTruncated {
 		image.Properties = append(image.Properties, Property{
 			Name:  "registry:truncated",

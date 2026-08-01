@@ -8,6 +8,8 @@ import (
 	"io"
 	"path"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // Limits bound the work a single scan may do, so a hostile or simply enormous
@@ -183,12 +185,6 @@ func (l LayerSource) compression() string {
 }
 
 func (s *layerScan) applyLayer(layer LayerSource) error {
-	// zstd layers would need a third-party decoder; they are skipped rather
-	// than failing the whole scan, and the omission is reported by the caller.
-	if layer.compression() == "zstd" {
-		return nil
-	}
-
 	rc, err := layer.Open()
 	if err != nil {
 		return err
@@ -196,11 +192,19 @@ func (s *layerScan) applyLayer(layer LayerSource) error {
 	defer rc.Close()
 
 	var body io.Reader = rc
-	if layer.compression() == "gzip" {
+	switch layer.compression() {
+	case "gzip":
 		zr, err := gzip.NewReader(rc)
 		if err != nil {
 			// Some layers are declared gzip but stored plain; fall back rather
 			// than discarding the layer.
+			return nil
+		}
+		defer zr.Close()
+		body = zr
+	case "zstd":
+		zr, err := zstd.NewReader(rc, zstd.WithDecoderConcurrency(1))
+		if err != nil {
 			return nil
 		}
 		defer zr.Close()

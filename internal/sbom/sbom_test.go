@@ -9,7 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/store"
@@ -83,6 +86,25 @@ func tarLayer(t *testing.T, files map[string]string, modes map[string]int64) []b
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close gzip: %v", err)
 	}
+	return buf.Bytes()
+}
+
+// tarLayerUncompressed builds a plain tar, for compressing another way.
+func tarLayerUncompressed(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("write body: %v", err)
+		}
+	}
+	tw.Close()
 	return buf.Bytes()
 }
 
@@ -197,22 +219,54 @@ func TestScanHonoursWhiteouts(t *testing.T) {
 	}
 }
 
-func TestScanSkipsZstdLayersWithoutFailing(t *testing.T) {
-	gz := tarLayer(t, map[string]string{"lib/apk/db/installed": alpineDB}, nil)
-	zstd := LayerSource{
-		Digest:    store.Digest([]byte("zstd-layer")),
+// zstd layers are decompressed rather than skipped. They were previously
+// ignored for want of a decoder, which silently under-reported any image built
+// with zstd compression.
+func TestScanReadsZstdLayers(t *testing.T) {
+	raw := tarLayerUncompressed(t, map[string]string{"lib/apk/db/installed": alpineDB})
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("zstd writer: %v", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	zw.Close()
+	compressed := buf.Bytes()
+
+	layer := LayerSource{
+		Digest:    store.Digest(compressed),
 		MediaType: "application/vnd.oci.image.layer.v1.tar+zstd",
 		Open: func() (io.ReadCloser, error) {
-			t.Error("a zstd layer must not be opened; it cannot be decoded")
-			return io.NopCloser(bytes.NewReader(nil)), nil
+			return io.NopCloser(bytes.NewReader(compressed)), nil
 		},
 	}
-	res, err := Scan([]LayerSource{layerFrom(gz), zstd}, DefaultLimits())
+	res, err := Scan([]LayerSource{layer}, DefaultLimits())
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 	if len(res.Packages) != 3 {
-		t.Fatalf("gzip layer should still be scanned; got %d packages", len(res.Packages))
+		t.Fatalf("found %d packages in a zstd layer, want 3", len(res.Packages))
+	}
+}
+
+// A layer that claims to be zstd but is not must not sink the whole scan.
+func TestScanToleratesCorruptZstdLayer(t *testing.T) {
+	good := tarLayer(t, map[string]string{"lib/apk/db/installed": alpineDB}, nil)
+	bad := LayerSource{
+		Digest:    store.Digest([]byte("not-zstd")),
+		MediaType: "application/vnd.oci.image.layer.v1.tar+zstd",
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("this is not compressed at all")), nil
+		},
+	}
+	res, err := Scan([]LayerSource{layerFrom(good), bad}, DefaultLimits())
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Packages) != 3 {
+		t.Fatalf("the readable layer should still be scanned; got %d", len(res.Packages))
 	}
 }
 

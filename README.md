@@ -243,6 +243,10 @@ All configuration is by environment variable.
 | `REGISTRY_PROXY_PREFIX` | `proxy` | Namespace the cache lives under; empty mirrors everything |
 | `REGISTRY_PROXY_USERNAME` / `REGISTRY_PROXY_PASSWORD` | — | Upstream credentials; anonymous pulls have far lower limits |
 | `REGISTRY_PROXY_TIMEOUT` | `120s` | Upstream request timeout |
+| `REGISTRY_TOKEN_AUTH` | `false` | Offer the Docker bearer-token scheme alongside Basic |
+| `REGISTRY_TOKEN_REALM` | `/token` | Absolute URL clients fetch tokens from |
+| `REGISTRY_TOKEN_SECRET` | *(generated)* | Signs issued tokens; required if running more than one instance |
+| `REGISTRY_TOKEN_TTL` | `5m` | How long an issued token stays valid |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -414,10 +418,10 @@ Output was checked against the images themselves rather than assumed correct:
 | `python:3.12-slim` | `pip list` → `pip 25.0.1` | `pkg:pypi/pip@25.0.1` |
 
 **Scope and limits.** Not covered: RubyGems, Maven, Cargo, Composer, NuGet, and
-binaries other than Go. `zstd`-compressed layers are skipped, and when that
-happens the document records it in a `registry:skippedLayers` property rather
-than silently under-reporting; reaching the language-package cap is recorded the
-same way as `registry:truncated`. Scans are bounded (file size, database size,
+binaries other than Go. `gzip` and `zstd` layers are both decompressed, and a
+layer that cannot be read is skipped without sinking the scan. Reaching the
+language-package cap is recorded in the document as `registry:truncated` rather
+than silently under-reporting. Scans are bounded (file size, database size,
 total bytes, entry count, manifest count, binary count) so a hostile image
 cannot exhaust the server. Indexes are not scanned directly — each platform
 manifest they point at is described on its own. Set `REGISTRY_SBOM=false` to
@@ -512,6 +516,39 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Token authentication
+
+HTTP Basic is the default and works with every client tested here. Setting
+`REGISTRY_TOKEN_AUTH=true` additionally offers the Docker bearer-token scheme,
+which Harbor, ECR, GCR and Docker Hub use and which some tooling assumes a
+registry speaks:
+
+```bash
+REGISTRY_TOKEN_AUTH=true
+REGISTRY_TOKEN_REALM=https://registry.example.com/token
+REGISTRY_TOKEN_SECRET=...    # required if you run more than one instance
+```
+
+A client is challenged with the token service and the scope it is attempting,
+fetches a token for that scope, and retries:
+
+```
+WWW-Authenticate: Bearer realm="https://registry.example.com/token",service="container-registry"
+GET /token?service=...&scope=repository:team-a/app:pull
+```
+
+The token service is part of the registry, so enabling this costs nothing
+operationally. Tokens are signed rather than stored: they are short-lived and
+self-describing, so validating one does not need a database round trip on every
+blob request. The requested scope is **narrowed** to what the caller actually
+has rather than trusted — asking for `pull,push` with a pull-only credential
+yields a token good for `pull` alone.
+
+Basic auth keeps working with this enabled, so turning it on cannot break a
+client that already works.
 
 ---
 

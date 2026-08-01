@@ -1638,3 +1638,148 @@ func TestGrantAPI(t *testing.T) {
 	resp = h.do(http.MethodDelete, "/api/repositories/team-a/api/grants/dev", nil)
 	h.expectStatus(resp, http.StatusOK, "revoke")
 }
+
+// ------------------------------------------------- bearer token auth
+
+func TestScopeParsing(t *testing.T) {
+	sc, ok := parseScope("repository:team-a/app:pull,push")
+	if !ok || sc.Type != "repository" || sc.Name != "team-a/app" {
+		t.Fatalf("parsed %+v ok=%v", sc, ok)
+	}
+	if len(sc.Actions) != 2 || sc.Actions[0] != "pull" || sc.Actions[1] != "push" {
+		t.Fatalf("actions = %v", sc.Actions)
+	}
+	if sc.String() != "repository:team-a/app:pull,push" {
+		t.Fatalf("round trip = %q", sc.String())
+	}
+	for _, bad := range []string{"", "repository", "repository:app", "repository::pull"} {
+		if _, ok := parseScope(bad); ok {
+			t.Errorf("parseScope(%q) should have failed", bad)
+		}
+	}
+}
+
+// With token auth on, the challenge must name the token service and the scope
+// being attempted, which is what drives a token-flow client.
+func TestTokenChallenge(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.TokenAuth = true
+	h.server.Cfg.TokenRealm = "https://registry.example.com/token"
+
+	resp := h.do(http.MethodGet, "/v2/", nil, anonymous())
+	h.expectStatus(resp, http.StatusUnauthorized, "anonymous with token auth")
+	challenge := resp.Header.Get("WWW-Authenticate")
+	for _, want := range []string{"Bearer", `realm="https://registry.example.com/token"`, "service="} {
+		if !strings.Contains(challenge, want) {
+			t.Errorf("challenge %q is missing %q", challenge, want)
+		}
+	}
+}
+
+// A token carries only the access the caller actually has: an over-broad scope
+// request is narrowed rather than granted.
+func TestTokenIssuanceNarrowsScope(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.server.Cfg.TokenAuth = true
+
+	hash, _ := auth.HashPassword("userpassword")
+	u, _ := h.db.CreateUser(ctx, "dev", hash, "user")
+	plaintext, prefix, secretHash, _ := auth.GenerateToken()
+	h.db.CreateToken(ctx, &db.Token{
+		Name: "scoped", UserID: u.ID, Prefix: prefix, SecretHash: secretHash,
+		CanPull: true, RepoPattern: "team-a/*",
+	})
+
+	// Ask for more than the credential allows: push on an out-of-scope repo.
+	var issued struct {
+		Token string `json:"token"`
+	}
+	h.mustJSON(h.do(http.MethodGet,
+		"/token?service=test&scope=repository:team-a/app:pull,push&scope=repository:team-b/x:pull",
+		nil, func(r *http.Request) { r.SetBasicAuth("dev", plaintext) }),
+		http.StatusOK, &issued)
+	if issued.Token == "" {
+		t.Fatal("no token issued")
+	}
+
+	parsed, err := h.server.verifyToken(issued.Token)
+	if err != nil {
+		t.Fatalf("the registry cannot verify its own token: %v", err)
+	}
+	// Pull on team-a/app is allowed; push is not, and team-b is out of scope.
+	if len(parsed.Scopes) != 1 || parsed.Scopes[0] != "repository:team-a/app:pull" {
+		t.Fatalf("granted scopes = %v, want only the pull it actually has", parsed.Scopes)
+	}
+}
+
+// A token issued for one repository must not work on another.
+func TestBearerTokenIsScopeLimited(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.TokenAuth = true
+	h.pushImage("team-a/app", "v1")
+	h.pushImage("team-b/other", "v1")
+
+	var issued struct {
+		Token string `json:"token"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/token?scope=repository:team-a/app:pull", nil),
+		http.StatusOK, &issued)
+
+	withBearer := func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+issued.Token)
+	}
+	resp := h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil, withBearer)
+	h.expectStatus(resp, http.StatusOK, "the repository the token names")
+
+	// A token that simply lacks the scope is answered with a challenge naming
+	// the scope it needs, not a flat refusal: that is how the token flow
+	// escalates, and a 403 would strand a client holding a token for a
+	// different repository.
+	resp = h.do(http.MethodGet, "/v2/team-b/other/manifests/v1", nil, withBearer)
+	h.expectStatus(resp, http.StatusUnauthorized, "a repository it does not name")
+	if ch := resp.Header.Get("WWW-Authenticate"); !strings.Contains(ch, "repository:team-b/other:pull") {
+		t.Fatalf("the challenge must name the scope needed, got %q", ch)
+	}
+
+	// The same for an action it was not granted.
+	resp = h.do(http.MethodPost, "/v2/team-a/app/blobs/uploads/", nil, withBearer)
+	h.expectStatus(resp, http.StatusUnauthorized, "an action it was not granted")
+	if ch := resp.Header.Get("WWW-Authenticate"); !strings.Contains(ch, "push") {
+		t.Fatalf("the challenge should ask for push, got %q", ch)
+	}
+}
+
+func TestTamperedBearerTokenRejected(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.TokenAuth = true
+
+	var issued struct {
+		Token string `json:"token"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/token?scope=repository:team-a/app:pull", nil),
+		http.StatusOK, &issued)
+
+	// Flip a character in the payload; the signature must no longer verify.
+	body, sig, _ := strings.Cut(issued.Token, ".")
+	tampered := body[:len(body)-1] + string(body[len(body)-1]^1) + "." + sig
+	if _, err := h.server.verifyToken(tampered); err == nil {
+		t.Fatal("a tampered token verified")
+	}
+	// A token signed with a different key must not verify either.
+	other := newHarness(t)
+	if _, err := other.server.verifyToken(issued.Token); err == nil {
+		t.Fatal("a token verified against a different registry's key")
+	}
+}
+
+// Basic auth must keep working with token auth enabled, or turning it on would
+// break every client that already works.
+func TestBasicStillWorksWithTokenAuthEnabled(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.TokenAuth = true
+	h.pushImage("team-a/app", "v1")
+
+	resp := h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil)
+	h.expectStatus(resp, http.StatusOK, "basic auth alongside token auth")
+}

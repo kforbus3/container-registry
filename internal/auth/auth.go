@@ -116,6 +116,28 @@ type Principal struct {
 	CanPush     bool
 	CanDelete   bool
 	RepoPattern string
+
+	// Scopes, when non-nil, are the access grants carried by a bearer token
+	// issued by this registry. They replace the pattern entirely: the token
+	// says exactly what it may do, and nothing outside that list is permitted.
+	Scopes []string
+}
+
+// scopeGrants reports whether the principal's bearer-token scopes permit an
+// action on a repository. It is only consulted when Scopes is non-nil.
+func (p *Principal) scopeGrants(repo, action string) bool {
+	want := "repository:" + repo + ":"
+	for _, s := range p.Scopes {
+		if !strings.HasPrefix(s, want) {
+			continue
+		}
+		for _, a := range strings.Split(strings.TrimPrefix(s, want), ",") {
+			if a == action {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Anonymous is the zero principal used when anonymous pull is enabled.
@@ -158,15 +180,33 @@ func (p *Principal) scopeAllows(repo string) bool {
 // CanPullRepo, CanPushRepo and CanDeleteRepo combine the verb permission with
 // the repository scope. Admin principals bypass both.
 func (p *Principal) CanPullRepo(repo string) bool {
-	return p != nil && (p.Admin || (p.CanPull && p.scopeAllows(repo)))
+	if p == nil {
+		return false
+	}
+	if p.Scopes != nil {
+		return p.scopeGrants(repo, "pull")
+	}
+	return p.Admin || (p.CanPull && p.scopeAllows(repo))
 }
 
 func (p *Principal) CanPushRepo(repo string) bool {
-	return p != nil && (p.Admin || (p.CanPush && p.scopeAllows(repo)))
+	if p == nil {
+		return false
+	}
+	if p.Scopes != nil {
+		return p.scopeGrants(repo, "push")
+	}
+	return p.Admin || (p.CanPush && p.scopeAllows(repo))
 }
 
 func (p *Principal) CanDeleteRepo(repo string) bool {
-	return p != nil && (p.Admin || (p.CanDelete && p.scopeAllows(repo)))
+	if p == nil {
+		return false
+	}
+	if p.Scopes != nil {
+		return p.scopeGrants(repo, "delete")
+	}
+	return p.Admin || (p.CanDelete && p.scopeAllows(repo))
 }
 
 // matchGlob matches pattern against s, where '*' matches any sequence of

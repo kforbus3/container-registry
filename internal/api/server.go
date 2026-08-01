@@ -50,6 +50,9 @@ type Server struct {
 	Metrics *metrics.Registry
 
 	upstream *proxy.Upstream
+
+	// tokenSecret signs bearer tokens; generated when none is configured.
+	tokenSecret string
 }
 
 // SetUpstream turns the registry into a pull-through cache for a remote.
@@ -125,9 +128,18 @@ func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request) bool {
 func urlPathUnescape(s string) (string, error) { return url.PathUnescape(s) }
 
 func NewServer(cfg *config.Config, database *db.DB, st *store.Store, log *slog.Logger) *Server {
+	secret := cfg.TokenSecret
+	if secret == "" {
+		// A generated key means issued tokens do not survive a restart, which
+		// is correct for one process. Running several requires setting the
+		// secret so they agree.
+		if generated, err := auth.NewSecret(32); err == nil {
+			secret = generated
+		}
+	}
 	return &Server{
 		Cfg: cfg, DB: database, Store: st, Auth: auth.New(database), Log: log,
-		Metrics: metrics.New(),
+		Metrics: metrics.New(), tokenSecret: secret,
 	}
 }
 
@@ -174,7 +186,28 @@ func (s *Server) ociErr(w http.ResponseWriter, status int, code, message string,
 // challenge sends a 401 with a Basic auth challenge, which is what makes
 // `docker login` prompt for and then send credentials.
 func (s *Server) challenge(w http.ResponseWriter, message string) {
-	w.Header().Set("WWW-Authenticate", `Basic realm="`+s.Cfg.Realm+`"`)
+	s.challengeScoped(w, message, "")
+}
+
+// challengeScoped sends the 401 that drives a client to authenticate.
+//
+// With token auth enabled the challenge names this registry's own token
+// service and the scope being attempted, which is what a token-flow client
+// needs to fetch a credential for exactly the operation it is retrying.
+func (s *Server) challengeScoped(w http.ResponseWriter, message, scope string) {
+	if s.Cfg.TokenAuth {
+		realm := strings.TrimRight(s.Cfg.TokenRealm, "/")
+		if realm == "" {
+			realm = "/token"
+		}
+		challenge := fmt.Sprintf(`Bearer realm=%q,service=%q`, realm, s.Cfg.Realm)
+		if scope != "" {
+			challenge += fmt.Sprintf(`,scope=%q`, scope)
+		}
+		w.Header().Set("WWW-Authenticate", challenge)
+	} else {
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+s.Cfg.Realm+`"`)
+	}
 	s.ociErr(w, http.StatusUnauthorized, codeUnauthorized, message, nil)
 }
 
@@ -248,7 +281,16 @@ func (s *Server) resolvePrincipal(r *http.Request) (*auth.Principal, error) {
 			}
 			return s.Auth.AuthenticateCredential(r.Context(), user, pass)
 		case "bearer":
-			return s.Auth.AuthenticateToken(r.Context(), strings.TrimSpace(value))
+			raw := strings.TrimSpace(value)
+			// An API token and a registry-issued bearer token both arrive this
+			// way; the API token has a recognisable prefix.
+			if _, _, ok := auth.SplitToken(raw); ok {
+				return s.Auth.AuthenticateToken(r.Context(), raw)
+			}
+			if p, ok := s.principalFromBearer(raw); ok {
+				return p, nil
+			}
+			return nil, auth.ErrBadCredentials
 		default:
 			return nil, auth.ErrBadCredentials
 		}
@@ -315,6 +357,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.Handle("/", s.uiHandler())
 
@@ -441,7 +484,8 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			"Total time spent serving requests, by kind.",
 			metrics.Labels{"kind": requestKind(r.URL.Path)}, time.Since(started).Seconds())
 		// Static UI assets would drown out anything useful.
-		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/v2") || strings.HasPrefix(r.URL.Path, "/api") {
+		if r.URL.Path == "/" || r.URL.Path == "/token" ||
+			strings.HasPrefix(r.URL.Path, "/v2") || strings.HasPrefix(r.URL.Path, "/api") {
 			s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "status", sr.status, "ip", remoteIP(r))
 		}
 	})

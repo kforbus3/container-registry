@@ -125,15 +125,20 @@ func (s *Server) serveV2(w http.ResponseWriter, r *http.Request) {
 // guard authenticates the caller and checks the requested action against the
 // repository before invoking next.
 func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act action, next http.HandlerFunc) {
+	// The challenge names the scope being attempted, which is what tells a
+	// token-flow client what to ask its token service for. Without it the
+	// client fetches a scopeless token and is then refused forever.
+	want := scopeFor(repo, act)
+
 	p, err := s.resolvePrincipal(r)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrDisabled):
-			s.challenge(w, "account is disabled")
+			s.challengeScoped(w, "account is disabled", want)
 		case errors.Is(err, auth.ErrTokenInactive):
-			s.challenge(w, "token is revoked or expired")
+			s.challengeScoped(w, "token is revoked or expired", want)
 		default:
-			s.challenge(w, "authentication required")
+			s.challengeScoped(w, "authentication required", want)
 		}
 		return
 	}
@@ -144,7 +149,7 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 		if act == actionPull && s.Cfg.AllowAnonymousPull && s.repoIsPublic(r, repo) {
 			p = auth.Anonymous()
 		} else {
-			s.challenge(w, "authentication required")
+			s.challengeScoped(w, "authentication required", want)
 			return
 		}
 	}
@@ -169,7 +174,15 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 	}
 	if !allowed {
 		if p.IsAnonymous() {
-			s.challenge(w, "authentication required")
+			s.challengeScoped(w, "authentication required", want)
+			return
+		}
+		// A bearer token that simply does not carry this scope is answered with
+		// a challenge rather than a refusal, so the client can fetch one that
+		// does. That is how the token flow is meant to escalate; a flat 403
+		// would strand a client holding a token for a different repository.
+		if p.Scopes != nil {
+			s.challengeScoped(w, "token does not grant "+want, want)
 			return
 		}
 		s.ociErr(w, http.StatusForbidden, codeDenied,
@@ -214,6 +227,19 @@ func (s *Server) grantAllows(r *http.Request, p *auth.Principal, name string, ac
 		return true
 	}
 	return db.RoleRank(role) >= db.RoleRank(need)
+}
+
+// scopeFor renders the access scope a request needs, in the form a token
+// service expects.
+func scopeFor(repo string, act action) string {
+	switch act {
+	case actionPush:
+		// A push reads as well as writes, so clients ask for both together.
+		return "repository:" + repo + ":pull,push"
+	case actionDelete:
+		return "repository:" + repo + ":delete"
+	}
+	return "repository:" + repo + ":pull"
 }
 
 func actionName(a action) string {

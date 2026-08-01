@@ -84,6 +84,19 @@ type Config struct {
 	ProxyUsername string
 	ProxyPassword string
 	ProxyTimeout  time.Duration
+	// TokenAuth offers the Docker bearer-token scheme alongside Basic. Basic
+	// works with every client tested here; this exists for tooling that assumes
+	// a registry speaks the token flow.
+	TokenAuth bool
+	// TokenSecret signs issued bearer tokens. Without it a key is generated at
+	// start-up, which is correct for one process and wrong for several.
+	TokenSecret string
+	// TokenTTL is how long an issued bearer token remains valid.
+	TokenTTL time.Duration
+	// TokenRealm is the absolute URL clients fetch tokens from. It must be
+	// reachable by them, which a bare path is not when the registry sits
+	// behind a proxy.
+	TokenRealm string
 }
 
 func Load() (*Config, error) {
@@ -114,6 +127,9 @@ func Load() (*Config, error) {
 		ProxyPrefix:        env("REGISTRY_PROXY_PREFIX", "proxy"),
 		ProxyUsername:      os.Getenv("REGISTRY_PROXY_USERNAME"),
 		ProxyPassword:      os.Getenv("REGISTRY_PROXY_PASSWORD"),
+		TokenAuth:          envBool("REGISTRY_TOKEN_AUTH", false),
+		TokenSecret:        os.Getenv("REGISTRY_TOKEN_SECRET"),
+		TokenRealm:         env("REGISTRY_TOKEN_REALM", "/token"),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -146,6 +162,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.ProxyTimeout, err = envDuration("REGISTRY_PROXY_TIMEOUT", 120*time.Second); err != nil {
+		return nil, err
+	}
+	if c.TokenTTL, err = envDuration("REGISTRY_TOKEN_TTL", 5*time.Minute); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
