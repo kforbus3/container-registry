@@ -224,6 +224,142 @@ $('#btn-password').addEventListener('click', async () => {
   } catch (ex) { toast(ex.message, 'error'); }
 });
 
+/* ------------------------------------------------------------- client hints
+
+Every command shown here has been run against this registry. The registry
+implements the OCI distribution specification rather than anything Docker
+specific, so the point of this section is that the choice of client is the
+operator's -- Docker is one option among several, not the assumed one.
+
+Each client differs in how it is told to accept a plain-HTTP registry, which is
+the single most common reason a first push fails, so that note lives with the
+commands rather than in a general remark. */
+
+const CLIENTS = {
+  docker: {
+    name: 'Docker',
+    login: (h, u) => `echo "$REGISTRY_TOKEN" | docker login ${h} -u ${u} --password-stdin`,
+    push: (h) => `docker login ${h}
+docker tag myapp:latest ${h}/myapp:latest
+docker push ${h}/myapp:latest`,
+    pull: (h, ref) => `docker pull ${h}/${ref}`,
+    insecure: 'Docker refuses plain HTTP unless the registry is listed under '
+      + '<code>insecure-registries</code> in <code>/etc/docker/daemon.json</code> '
+      + '(Docker Desktop: Settings &rarr; Docker Engine), followed by a restart. '
+      + '<code>localhost</code> is exempt.',
+  },
+  podman: {
+    name: 'Podman',
+    login: (h, u) => `echo "$REGISTRY_TOKEN" | podman login ${h} -u ${u} --password-stdin`,
+    push: (h) => `podman login ${h}
+podman tag myapp:latest ${h}/myapp:latest
+podman push ${h}/myapp:latest`,
+    pull: (h, ref) => `podman pull ${h}/${ref}`,
+    insecure: 'Pass <code>--tls-verify=false</code> to every command, including '
+      + '<code>login</code>. Buildah takes the same flag.',
+  },
+  skopeo: {
+    name: 'skopeo',
+    login: (h, u) => `echo "$REGISTRY_TOKEN" | skopeo login ${h} -u ${u} --password-stdin`,
+    push: (h) => `# copy straight from the local daemon, no tag dance
+skopeo copy docker-daemon:myapp:latest docker://${h}/myapp:latest`,
+    pull: (h, ref) => `skopeo copy docker://${h}/${ref} docker-daemon:${ref}
+
+# or inspect it without pulling
+skopeo inspect docker://${h}/${ref}`,
+    insecure: 'Pass <code>--tls-verify=false</code>. For <code>copy</code>, which '
+      + 'touches two registries, the flags are <code>--src-tls-verify</code> and '
+      + '<code>--dest-tls-verify</code> separately.',
+  },
+  crane: {
+    name: 'crane',
+    login: (h, u) => `crane auth login ${h} -u ${u} -p "$REGISTRY_TOKEN"`,
+    push: (h) => `# push a tarball, or copy an image between registries
+crane push myapp.tar ${h}/myapp:latest
+crane copy alpine:3.20 ${h}/alpine:3.20`,
+    pull: (h, ref) => `crane pull ${h}/${ref} myapp.tar
+
+# digest and manifest without downloading layers
+crane digest ${h}/${ref}`,
+    insecure: 'Pass <code>--insecure</code>.',
+  },
+  oras: {
+    name: 'ORAS',
+    login: (h, u) => `echo "$REGISTRY_TOKEN" | oras login ${h} -u ${u} --password-stdin`,
+    push: (h) => `# any file is a valid OCI artifact, not just images
+oras push ${h}/myartifact:v1 ./report.json:application/json`,
+    pull: (h, ref) => `oras pull ${h}/${ref}
+
+# what is attached to it (SBOMs, signatures, attestations)
+oras discover ${h}/${ref}`,
+    insecure: 'Pass <code>--plain-http</code>.',
+  },
+  helm: {
+    name: 'Helm',
+    login: (h, u) => `echo "$REGISTRY_TOKEN" | helm registry login ${h} -u ${u} --password-stdin`,
+    push: (h) => `helm package mychart
+helm push mychart-0.1.0.tgz oci://${h}/charts`,
+    pull: (h, ref, tag) => `helm pull oci://${h}/${ref.split(':')[0]} --version ${tag}`,
+    insecure: 'Pass <code>--plain-http</code> to <strong>both</strong> '
+      + '<code>helm registry login</code> and <code>helm push</code>/<code>pull</code>. '
+      + 'Setting it on only one of them fails with '
+      + '<code>basic credential not found</code>.',
+  },
+};
+
+// The order clients are offered in. Image clients first; ORAS and Helm handle
+// artifacts that are not images at all.
+const IMAGE_CLIENTS = ['docker', 'podman', 'skopeo', 'crane', 'oras'];
+const HELM_CLIENTS = ['helm', 'oras', 'skopeo', 'crane'];
+
+// helmChartType is the config media type Helm gives its chart manifests.
+const HELM_CHART_TYPE = 'application/vnd.cncf.helm.config.v1+json';
+
+// Remember the operator's client across pages and sessions: someone using
+// Podman is not going to want Docker instructions on the next page either.
+function currentClient(ids) {
+  const saved = localStorage.getItem('registry.client');
+  return ids.includes(saved) ? saved : ids[0];
+}
+
+// blocks holds the render function for each tab strip on the page, so choosing
+// a client can redraw just that block.
+const clientBlocks = {};
+
+/**
+ * Render a client picker over a set of equivalent commands.
+ *
+ * @param {string} key    unique id for this block on the page
+ * @param {string[]} ids  clients to offer, in order
+ * @param {(c: object, id: string) => string} body  renders one client's commands
+ */
+function clientTabs(key, ids, body) {
+  clientBlocks[key] = { ids, body };
+  return `<div id="ct-${key}">${clientTabsInner(key)}</div>`;
+}
+
+function clientTabsInner(key) {
+  const { ids, body } = clientBlocks[key];
+  const active = currentClient(ids);
+  const tabs = ids.map((id) => `<button class="${id === active ? 'active' : ''}"
+      onclick="pickClient('${jsq(key)}','${jsq(id)}')">${esc(CLIENTS[id].name)}</button>`).join('');
+  const client = CLIENTS[active];
+  const insecure = location.protocol !== 'https:' && client.insecure
+    ? `<p class="muted small" style="margin-top:.7rem"><strong>Plain HTTP:</strong> ${client.insecure}</p>`
+    : '';
+  return `<div class="tabs">${tabs}</div><pre>${esc(body(client, active))}</pre>${insecure}`;
+}
+
+window.pickClient = (key, id) => {
+  localStorage.setItem('registry.client', id);
+  // Every tab strip on the page follows the same choice, so the page does not
+  // end up showing Podman in one card and Docker in another.
+  Object.keys(clientBlocks).forEach((k) => {
+    const el = document.getElementById(`ct-${k}`);
+    if (el) el.innerHTML = clientTabsInner(k);
+  });
+};
+
 /* ----------------------------------------------------------------- router */
 
 const routes = {
@@ -320,12 +456,11 @@ async function renderOverview(view) {
 
     <div class="card">
       <h2>Push your first image</h2>
-      <pre>docker login ${esc(host)}
-docker tag myapp:latest ${esc(host)}/myapp:latest
-docker push ${esc(host)}/myapp:latest</pre>
+      ${clientTabs('push', IMAGE_CLIENTS, (c) => c.push(host))}
       <p class="muted small" style="margin-top:.7rem">
         Sign in with your username and either your password or an API token as the password.
-        ${stats.tls ? '' : 'This registry is serving plain HTTP, so add it to Docker\'s <code>insecure-registries</code> unless you reach it over localhost.'}
+        This registry implements the OCI distribution specification, so any conformant
+        client works — these are the ones it is tested against.
       </p>
     </div>`;
 }
@@ -401,6 +536,10 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
 
   const vulns = data.vulnerabilities || {};
   const anyScanned = Object.keys(vulns).length > 0;
+  // Helm charts are pulled with helm, not docker, so offer the clients that
+  // actually apply to what this repository holds.
+  const isChart = (data.manifests || []).some((m) => m.artifact_type === HELM_CHART_TYPE);
+  const pullTag = tags[0] ? tags[0].name : 'latest';
   const tagRows = tags.map((t) => `<tr>
     <td><strong>${esc(t.name)}</strong></td>
     ${anyScanned ? `<td>${sevSummary(vulns[t.name]) || '<span class="muted small">—</span>'}</td>` : ''}
@@ -506,8 +645,9 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
     </div>
 
     <div class="card">
-      <h2>Pull this image</h2>
-      <pre>docker pull ${esc(host)}/${esc(repo.name)}:${esc(tags[0] ? tags[0].name : 'latest')}</pre>
+      <h2>Pull this ${isChart ? 'chart' : 'image'}</h2>
+      ${clientTabs('pull', isChart ? HELM_CLIENTS : IMAGE_CLIENTS,
+        (c) => c.pull(host, `${repo.name}:${pullTag}`, pullTag))}
     </div>`;
 
   bindTagSearch(repo.name);
@@ -955,7 +1095,7 @@ async function renderTokens(view) {
   });
 
   view.innerHTML = pageHead('API Tokens',
-    'Tokens authenticate <code>docker login</code> and the management API.',
+    'Tokens authenticate any OCI client and the management API.',
     '<button class="btn primary" onclick="createToken()">New token</button>') +
     `<div class="card">
       ${tableOrEmpty(rows,
@@ -966,10 +1106,12 @@ async function renderTokens(view) {
 
     <div class="card">
       <h2>Using a token</h2>
-      <pre>echo "$REGISTRY_TOKEN" | docker login ${esc(location.host)} -u ${esc(state.me.username)} --password-stdin
-
-curl -H "Authorization: Bearer $REGISTRY_TOKEN" \\
-  https://${esc(location.host)}/api/repositories</pre>
+      ${clientTabs('token', IMAGE_CLIENTS.concat('helm'),
+        (c) => c.login(location.host, state.me.username))}
+      <p class="muted small" style="margin-top:.7rem">The same token authenticates the
+        management API:</p>
+      <pre>curl -H "Authorization: Bearer $REGISTRY_TOKEN" \\
+  ${esc(location.protocol)}//${esc(location.host)}/api/repositories</pre>
     </div>`;
 }
 

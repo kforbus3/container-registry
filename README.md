@@ -110,10 +110,19 @@ client implementations — deliberately not just Docker:
 | **crane** | google/go-containerregistry | copy from Docker Hub, catalog, ls, digest, manifest |
 | **skopeo** | containers/image (the Podman/Buildah/CRI-O stack) | multi-arch copy, list-tags, inspect |
 | **ORAS** | oras-project | arbitrary artifacts, attach, discover, pull |
+| **Podman** | containers/podman | login, pull, tag, push |
+| **Helm** | helm, OCI charts | registry login, push, pull of `oci://` charts |
 | **Docker / buildx** | moby | login, push, pull, multi-platform build --push |
 
 Cross-client interoperability is exercised too: an image pushed by crane, with a
 referrer attached by ORAS, discovered back through the referrers API.
+
+The web UI reflects this rather than assuming Docker: the push, pull and token
+cards each offer the same operation for every client above, including the flag
+that client needs to accept a plain-HTTP registry — the usual reason a first
+push fails, and different in every one of them. A repository holding Helm charts
+offers chart commands instead of image ones. Every command shown was run against
+this registry.
 
 ## What it does
 

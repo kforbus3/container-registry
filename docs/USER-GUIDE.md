@@ -403,6 +403,51 @@ keeps them; `docker compose down -v` **deletes them permanently**.
 
 ---
 
+## Not using Docker?
+
+Nothing here depends on Docker — the registry implements the OCI distribution
+specification, and this guide simply picks one client to keep the walkthrough
+concrete. The **web UI prints the equivalent commands for whichever client you
+use**: open the overview, a repository, or the API Tokens page and choose from
+the tabs above each command block.
+
+The equivalent of "log in, tag, push" in each:
+
+```bash
+# Podman -- same verbs as Docker; add --tls-verify=false for plain HTTP
+podman login localhost:5001
+podman tag myapp:latest localhost:5001/demo/myapp:1.0
+podman push localhost:5001/demo/myapp:1.0
+
+# skopeo -- copies straight out of the local daemon, no tagging step
+skopeo copy --dest-tls-verify=false \
+  docker-daemon:myapp:latest docker://localhost:5001/demo/myapp:1.0
+
+# crane -- also copies registry to registry without a local daemon
+crane auth login localhost:5001 -u admin
+crane copy --insecure alpine:3.20 localhost:5001/demo/alpine:3.20
+
+# ORAS -- for artifacts that are not images at all
+oras push --plain-http localhost:5001/demo/report:v1 ./report.json:application/json
+
+# Helm -- OCI charts; --plain-http is needed on BOTH login and push
+helm registry login localhost:5001 -u admin --plain-http
+helm push mychart-0.1.0.tgz oci://localhost:5001/charts --plain-http
+```
+
+Each client has its own way of being told to accept a plain-HTTP registry, and
+getting it wrong is the most common cause of a failed first push:
+
+| Client | Plain HTTP |
+| --- | --- |
+| Docker | list the host under `insecure-registries` in `daemon.json`, then restart |
+| Podman, skopeo, Buildah | `--tls-verify=false` |
+| crane | `--insecure` |
+| ORAS | `--plain-http` |
+| Helm | `--plain-http` on **both** `registry login` and `push`/`pull` |
+
+---
+
 ## Cheat sheet
 
 ```bash
