@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/kforbus3/container-registry/internal/auth"
 	"github.com/kforbus3/container-registry/internal/db"
@@ -748,25 +747,121 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 		return
 
 	case http.MethodGet:
-		f, _, err := s.Store.Open(digest)
+		size, _, err := s.Store.Stat(digest)
 		if err != nil {
 			s.ociErr(w, http.StatusNotFound, codeBlobUnknown, "blob content missing", digest)
 			return
 		}
-		defer f.Close()
 		w.Header().Set("Docker-Content-Digest", digest)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		// Blobs are immutable, so they can be cached indefinitely.
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Etag", `"`+digest+`"`)
-		// ServeContent handles Range requests and conditional headers. A zero
-		// modtime suppresses Last-Modified, which is meaningless for a blob
-		// named by its own content.
-		http.ServeContent(w, r, "", time.Time{}, f)
+		w.Header().Set("Accept-Ranges", "bytes")
+		s.serveBlobRange(w, r, digest, size)
 		return
 
 	default:
 		s.ociErr(w, http.StatusMethodNotAllowed, codeUnsupported, "method not allowed", nil)
+	}
+}
+
+// serveBlobRange writes a blob, honouring a single byte range.
+//
+// Ranges are handled here rather than by http.ServeContent because a blob may
+// live in an object store, which returns a stream and not a seekable file.
+// Multi-range requests are answered in full, which the specification permits
+// and no registry client asks for.
+func (s *Server) serveBlobRange(w http.ResponseWriter, r *http.Request, digest string, size int64) {
+	start, end, ok, satisfiable := parseByteRange(r.Header.Get("Range"), size)
+	if !satisfiable {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		s.ociErr(w, http.StatusRequestedRangeNotSatisfiable, codeBlobUnknown,
+			"requested range is outside the blob", nil)
+		return
+	}
+
+	if !ok {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		rc, err := s.Store.Open2(digest)
+		if err != nil {
+			return // headers are already sent; the truncated body signals failure
+		}
+		defer rc.Close()
+		io.Copy(w, rc)
+		return
+	}
+
+	length := end - start + 1
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(http.StatusPartialContent)
+
+	rc, err := s.Store.OpenRange(digest, start, length)
+	if err != nil {
+		return
+	}
+	defer rc.Close()
+	io.Copy(w, rc)
+}
+
+// parseByteRange reads a single "bytes=" range against a known size.
+//
+// ok reports whether a range was requested at all; satisfiable reports whether
+// it can be served, which is the difference between 200 and 416.
+func parseByteRange(header string, size int64) (start, end int64, ok, satisfiable bool) {
+	header = strings.TrimSpace(header)
+	if header == "" || !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false, true
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	// Only the first range of a multi-range request is considered; the rest
+	// fall back to serving the whole blob.
+	if strings.Contains(spec, ",") {
+		return 0, 0, false, true
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false, true
+	}
+	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
+
+	switch {
+	case first == "" && last == "":
+		return 0, 0, false, true
+	case first == "":
+		// A suffix range: the final N bytes.
+		n, err := strconv.ParseInt(last, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false, false
+		}
+		if n > size {
+			n = size
+		}
+		return size - n, size - 1, true, true
+	default:
+		start, err := strconv.ParseInt(first, 10, 64)
+		if err != nil || start < 0 {
+			return 0, 0, false, false
+		}
+		if start >= size {
+			return 0, 0, false, false
+		}
+		end := size - 1
+		if last != "" {
+			end, err = strconv.ParseInt(last, 10, 64)
+			if err != nil || end < start {
+				return 0, 0, false, false
+			}
+			if end >= size {
+				end = size - 1
+			}
+		}
+		return start, end, true, true
 	}
 }
 

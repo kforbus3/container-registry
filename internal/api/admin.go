@@ -827,6 +827,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"max_upload_bytes": s.Cfg.MaxUploadBytes,
 		"session_ttl":      s.Cfg.SessionTTL.String(),
 		"storage_root":     s.Store.Root(),
+		"storage_backend":  s.Store.Backend(),
 		"gc_grace":         s.collector.Grace.String(),
 		"gc_upload_ttl":    s.collector.UploadTTL.String(),
 	})

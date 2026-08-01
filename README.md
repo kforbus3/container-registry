@@ -6,8 +6,8 @@ Specification](https://github.com/opencontainers/distribution-spec) v1.1. It
 so it works with any OCI client, not just Docker. Every image pushed to it is
 automatically described by a CycloneDX SBOM, published back as an OCI referrer.
 
-Single Go binary, embedded web UI, SQLite metadata, filesystem blob storage.
-No external services.
+Single Go binary, embedded web UI, SQLite metadata, and blobs on local disk or
+any S3-compatible object store. No external services required.
 
 ```
 $ make conformance
@@ -205,6 +205,13 @@ All configuration is by environment variable.
 | `REGISTRY_RATE_LIMIT` | `0` | Requests per minute per caller; `0` disables |
 | `REGISTRY_RATE_LIMIT_WRITES` | *(uses `RATE_LIMIT`)* | Separate, usually lower, limit for pushes and deletes |
 | `REGISTRY_RATE_BURST` | *(one second's worth)* | How many requests may arrive at once |
+| `REGISTRY_S3_BUCKET` | — | Setting this moves blobs to an object store |
+| `REGISTRY_S3_ENDPOINT` | *(derived from region)* | `http://minio:9000`, or an AWS endpoint |
+| `REGISTRY_S3_REGION` | `us-east-1` | Signing region |
+| `REGISTRY_S3_ACCESS_KEY` / `REGISTRY_S3_SECRET_KEY` | — | Credentials |
+| `REGISTRY_S3_SESSION_TOKEN` | — | For temporary credentials |
+| `REGISTRY_S3_PREFIX` | — | Key prefix, so one bucket can hold several registries |
+| `REGISTRY_S3_PATH_STYLE` | `true` | Path-style addressing; MinIO and most gateways need it |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -468,6 +475,42 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Object storage
+
+Blobs live on local disk by default. Setting `REGISTRY_S3_BUCKET` moves them to
+any S3-compatible store — AWS, MinIO, Ceph RADOS Gateway, Backblaze B2,
+Cloudflare R2 — which is what lifts the single-host limit:
+
+```bash
+REGISTRY_S3_ENDPOINT=http://minio:9000
+REGISTRY_S3_BUCKET=registry-blobs
+REGISTRY_S3_ACCESS_KEY=...
+REGISTRY_S3_SECRET_KEY=...
+REGISTRY_S3_PREFIX=production      # optional; one bucket, several registries
+```
+
+Signing is AWS Signature Version 4, implemented directly rather than by
+depending on an SDK: the registry needs six S3 operations, and the algorithm is
+a page of well-specified hashing against a very large dependency. Upload bodies
+are streamed with `UNSIGNED-PAYLOAD` — hashing a multi-gigabyte layer twice to
+satisfy a signature would defeat the point of streaming, and the registry
+verifies the digest itself regardless.
+
+Upload scratch space stays on local disk even when blobs do not. An in-progress
+upload is appended to and re-read constantly, and object stores charge per
+request.
+
+**Verified against MinIO**: the full OCI conformance suite passes with blobs in
+object storage — 986 assertions, zero failures — as do byte-range reads,
+garbage collection walking and deleting bucket objects, and pulls through both
+crane and skopeo.
+
+The SQLite metadata database is still local, so this removes the storage
+bottleneck but not the single-writer one. Two registry processes cannot yet
+share a database.
 
 ---
 

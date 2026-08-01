@@ -46,7 +46,9 @@ func run() error {
 	}
 	defer database.Close()
 
-	st, err := store.New(cfg.DataDir, cfg.MaxUploadBytes)
+	// Blobs live in an object store when one is configured, and on local disk
+	// otherwise. Upload scratch space stays local either way.
+	st, err := openStore(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -186,6 +188,22 @@ func writeLimit(cfg *config.Config) int {
 		return cfg.RateLimitWrites
 	}
 	return cfg.RateLimit
+}
+
+// openStore builds the blob store, choosing an object store when configured.
+func openStore(cfg *config.Config, log *slog.Logger) (*store.Store, error) {
+	s3cfg, ok := store.S3ConfigFromEnv()
+	if !ok {
+		return store.New(cfg.DataDir, cfg.MaxUploadBytes)
+	}
+	backend, err := store.NewS3Backend(s3cfg)
+	if err != nil {
+		return nil, fmt.Errorf("configure S3 storage: %w", err)
+	}
+	log.Info("using object storage for blobs",
+		"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
+		"prefix", s3cfg.Prefix, "path_style", s3cfg.PathStyle)
+	return store.NewWithBackend(cfg.DataDir, cfg.MaxUploadBytes, backend)
 }
 
 func logLevel() slog.Level {
