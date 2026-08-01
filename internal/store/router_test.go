@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -110,4 +111,52 @@ func name(b Backend) string {
 		return "<nil>"
 	}
 	return b.Name()
+}
+
+// TestPlacementSurvivesRuleChange is the regression test for a rule change
+// breaking every repository it matched. Adding a rule must not redirect reads
+// of content that is already somewhere else: the bytes do not move with the
+// rule, so following it would 404 every image the repository already held.
+func TestPlacementSurvivesRuleChange(t *testing.T) {
+	def := namedBackend(t, "default")
+	archive := namedBackend(t, "archive")
+	r := NewRouter(def)
+
+	// A repository whose blobs were written to the default backend.
+	r.SetPlacement("public/web", def.Name())
+
+	// Later, a rule says that namespace belongs in the archive backend.
+	r.Replace([]Rule{{Pattern: "public/*", Backend: "archive"}},
+		map[string]Backend{"archive": archive})
+
+	got, why := r.Resolve("public/web")
+	if got != def {
+		t.Errorf("reads redirected to %s; they must stay with the bytes in %s",
+			name(got), name(def))
+	}
+	if why != "placed" {
+		t.Errorf("resolution reason %q, want \"placed\"", why)
+	}
+	// The rules still say where it ought to end up, which is what a migration
+	// aims at and what marks it misplaced.
+	if target, _ := r.Target("public/web"); target != archive {
+		t.Errorf("target is %s, want %s", name(target), name(archive))
+	}
+	// A repository with no content yet follows the rule immediately.
+	if b, _ := r.Resolve("public/brand-new"); b != archive {
+		t.Errorf("a repository with no blobs routed to %s, want %s", name(b), name(archive))
+	}
+}
+
+// TestPlacementToMissingBackendFails covers a backend that has been removed
+// from under content that still lives in it.
+func TestPlacementToMissingBackendFails(t *testing.T) {
+	def := namedBackend(t, "default")
+	r := NewRouter(def)
+	r.SetPlacement("orphan/app", "s3(https://gone.example/bucket)")
+	if b, why := r.Resolve("orphan/app"); b != nil {
+		t.Errorf("resolved to %s; the bytes are not readable from anywhere configured", name(b))
+	} else if !strings.HasPrefix(why, "placed:") {
+		t.Errorf("reason %q does not say where it was placed", why)
+	}
 }

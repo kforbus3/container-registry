@@ -155,6 +155,26 @@ func (d *DB) RepoStorage(ctx context.Context, repoID int64) (string, bool) {
 	return b, true
 }
 
+// AllRepoStorage returns where every repository's blobs currently are.
+func (d *DB) AllRepoStorage(ctx context.Context) (map[string]string, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT rep.name, rs.backend FROM repository_storage rs
+		  JOIN repositories rep ON rep.id = rs.repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var name, backend string
+		if err := rows.Scan(&name, &backend); err != nil {
+			return nil, err
+		}
+		out[name] = backend
+	}
+	return out, rows.Err()
+}
+
 // MisplacedRepos lists repositories whose recorded storage differs from what
 // the rules would choose now, which is exactly the set needing a migration.
 func (d *DB) MisplacedRepos(ctx context.Context, resolve func(string) string) ([]string, error) {

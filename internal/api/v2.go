@@ -1175,7 +1175,9 @@ func (s *Server) completeUploadAt(w http.ResponseWriter, r *http.Request, repo *
 	// difference between this and what the rules now say is what tells an
 	// operator the repository needs migrating rather than leaving them to
 	// discover it from a 404.
-	s.DB.RecordRepoStorage(r.Context(), repo.ID, rs.BackendName())
+	placed := rs.BackendName()
+	s.DB.RecordRepoStorage(r.Context(), repo.ID, placed)
+	s.Store.Router().SetPlacement(repo.Name, placed)
 	// Enforce the quota after the bytes have landed but before the blob is
 	// linked, so an over-quota push is rejected without the repository being
 	// charged for it. The orphaned blob is reclaimed by garbage collection.
