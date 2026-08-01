@@ -448,11 +448,6 @@ async function renderOverview(view) {
       ${stat('Unique blobs', stats.blobs)}
       ${stat('Storage on disk', bytes(stats.disk_bytes), `${stats.disk_blob_count} objects`)}
       ${stat('Active tokens', stats.active_tokens)}
-      ${stats.vuln && stats.vuln.enabled
-        ? stat('Vulnerabilities',
-            `${stats.vuln.critical || 0}C / ${stats.vuln.high || 0}H`,
-            `${stats.vuln.images_scanned || 0} images scanned`)
-        : ''}
     </div>
 
     <div class="card">
@@ -542,15 +537,12 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
   const canWrite = state.me.admin || state.me.can_push;
   const canDelete = state.me.admin || state.me.can_delete;
 
-  const vulns = data.vulnerabilities || {};
-  const anyScanned = Object.keys(vulns).length > 0;
   // Helm charts are pulled with helm, not docker, so offer the clients that
   // actually apply to what this repository holds.
   const isChart = (data.manifests || []).some((m) => m.artifact_type === HELM_CHART_TYPE);
   const pullTag = tags[0] ? tags[0].name : 'latest';
   const tagRows = tags.map((t) => `<tr>
     <td><strong>${esc(t.name)}</strong></td>
-    ${anyScanned ? `<td>${sevSummary(vulns[t.name]) || '<span class="muted small">—</span>'}</td>` : ''}
     <td><span class="digest" onclick="copy('${jsq(t.digest)}')"
         title="${esc(t.digest)} — click to copy">${esc(shortDigest(t.digest))}</span></td>
     <td class="num">${esc(bytes(t.size))}</td>
@@ -594,7 +586,7 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
       <h2>Tags <span class="badge">${totalTags}</span></h2>
       <div class="field"><input id="tag-search" placeholder="Filter tags…" value="${esc(search)}"></div>
       ${tableOrEmpty(tagRows,
-        `<tr><th>Tag</th>${anyScanned ? '<th>Risk</th>' : ''}<th>Digest</th><th class="num">Size</th><th>Updated</th><th></th></tr>`,
+        `<tr><th>Tag</th><th>Digest</th><th class="num">Size</th><th>Updated</th><th></th></tr>`,
         search ? 'No tags match that filter.' : 'No tags in this repository.')}
       ${totalTags > TAG_PAGE_SIZE ? `<div class="row" style="margin-top:.8rem;justify-content:space-between">
         <span class="muted small">${offset + 1}–${Math.min(offset + TAG_PAGE_SIZE, totalTags)} of ${totalTags}</span>
@@ -888,127 +880,11 @@ async function renderManifest(view, [repo, digest]) {
 
     ${sbomCard(repo, digest, data.sbom)}
 
-    ${vulnCard(repo, digest, data.vulnerabilities)}
-
     <div class="card">
       <h2>Raw manifest</h2>
       <pre>${esc(JSON.stringify(data.content, null, 2))}</pre>
     </div>`;
 }
-
-/** Compact severity summary, e.g. "2C 14H 30M". Empty when nothing was found. */
-function sevSummary(v) {
-  if (!v) return '';
-  if (v.status && v.status !== 'ok') return '<span class="badge warn">scan failed</span>';
-  const parts = [];
-  if (v.critical) parts.push(`<span class="badge danger">${v.critical}C</span>`);
-  if (v.high) parts.push(`<span class="badge danger">${v.high}H</span>`);
-  if (v.medium) parts.push(`<span class="badge warn">${v.medium}M</span>`);
-  if (v.low) parts.push(`<span class="badge">${v.low}L</span>`);
-  if (!parts.length) return '<span class="badge ok">clean</span>';
-  return parts.join(' ');
-}
-
-/** Render the vulnerability panel for a manifest. */
-function vulnCard(repo, digest, v) {
-  if (!v) {
-    return `<div class="card">
-      <h2>Vulnerabilities</h2>
-      <p class="muted small">Not scanned yet. Images are checked against an advisory
-      database shortly after their bill of materials is generated.</p>
-      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Scan now</button>
-    </div>`;
-  }
-  if (v.status !== 'ok') {
-    return `<div class="card">
-      <h2>Vulnerabilities <span class="badge warn">scan failed</span></h2>
-      <p class="muted small">${esc(v.error || 'The advisory database could not be reached.')}</p>
-      <p class="muted small">This does <strong>not</strong> mean the image is clean —
-      it means it could not be checked.</p>
-      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Retry scan</button>
-    </div>`;
-  }
-  const total = v.critical + v.high + v.medium + v.low + v.unknown;
-  return `<div class="card">
-    <h2>Vulnerabilities ${sevSummary(v)}</h2>
-    <dl class="kv">
-      <dt>Findings</dt><dd>${total} across ${v.components} components</dd>
-      <dt>Fixable</dt><dd>${v.fixable} ${v.fixable ? 'have a fixed version available' : ''}</dd>
-      ${v.unqueryable ? `<dt>Not checked</dt><dd>${v.unqueryable} components no advisory database indexes</dd>` : ''}
-      <dt>Scanned</dt><dd>${esc(fullDate(v.scanned_at))} against <code>${esc(v.source)}</code></dd>
-    </dl>
-    <div class="row" style="margin-top:.8rem">
-      ${total ? `<button class="btn primary" onclick="viewVulns('${jsq(repo)}','${jsq(digest)}')">View findings</button>` : ''}
-      <button class="btn ghost" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Re-scan</button>
-    </div>
-  </div>`;
-}
-
-window.viewVulns = async (repo, digest) => {
-  try {
-    const d = await api(`/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}/vulnerabilities`);
-    const rows = (d.findings || []).map((f) => `<tr>
-      <td><span class="badge ${f.severity === 'CRITICAL' || f.severity === 'HIGH' ? 'danger'
-          : f.severity === 'MEDIUM' ? 'warn' : ''}">${esc(f.severity)}</span>
-        ${f.cvss ? `<div class="muted small">${f.cvss}</div>` : ''}</td>
-      <td>${esc(f.package)}<div class="muted small mono">${esc(f.version || '')}</div></td>
-      <td class="small">${esc(f.vuln_id)}
-        ${f.aliases && f.aliases.length ? `<div class="muted small">${esc(f.aliases.slice(0, 2).join(', '))}</div>` : ''}
-        ${f.summary ? `<div class="muted small">${esc(f.summary.slice(0, 90))}</div>` : ''}</td>
-      <td class="mono small">${f.fixed_version ? esc(f.fixed_version) : '<span class="muted">no fix</span>'}</td>
-    </tr>`);
-    await modal({
-      title: `${d.findings.length} findings`,
-      okLabel: 'Close',
-      dismissOnly: true,
-      bodyHTML: `<div style="max-height:60vh;overflow:auto">
-        ${tableOrEmpty(rows, '<tr><th>Severity</th><th>Package</th><th>Advisory</th><th>Fixed in</th></tr>',
-          'No known vulnerabilities.')}
-      </div>`,
-    });
-  } catch (ex) { toast(ex.message, 'error'); }
-};
-
-window.rescan = async (repo, digest, btn) => {
-  const base = `/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}`;
-  // Remember when the current result was produced, so completion can be
-  // detected rather than guessed at: a re-scan of an unchanged image usually
-  // returns the same counts, and waiting a fixed interval then re-rendering
-  // looks identical to nothing having happened.
-  let before = null;
-  try {
-    const cur = await api(base);
-    before = cur.vulnerabilities ? cur.vulnerabilities.scanned_at : null;
-  } catch { /* no prior scan; any result counts as completion */ }
-
-  if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
-  try {
-    await api(`${base}/rescan`, { method: 'POST' });
-  } catch (ex) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
-    toast(ex.message, 'error');
-    return;
-  }
-
-  // Scanning is queued and hits a third-party advisory database, so it takes
-  // seconds rather than milliseconds. Poll until the timestamp moves.
-  const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 2000));
-    let v = null;
-    try {
-      v = (await api(base)).vulnerabilities;
-    } catch { break; }
-    if (v && v.scanned_at !== before) {
-      toast(v.status === 'ok' ? 'Scan complete' : 'Scan finished with errors',
-        v.status === 'ok' ? 'success' : 'error');
-      route();
-      return;
-    }
-  }
-  if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
-  toast('Scan is taking longer than expected — it is still running', 'error');
-};
 
 /** Render the SBOM panel for a manifest, generated automatically on push. */
 function sbomCard(repo, digest, sbom) {
@@ -1419,9 +1295,6 @@ async function renderMaintenance(view) {
         <dt>Max upload</dt><dd>${settings.max_upload_bytes ? esc(bytes(settings.max_upload_bytes)) : 'unlimited'}</dd>
         <dt>Session lifetime</dt><dd>${esc(settings.session_ttl)}</dd>
         <dt>SBOM generation</dt><dd>${settings.sbom_enabled ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}</dd>
-        <dt>Vulnerability scan</dt><dd>${settings.vuln_enabled
-          ? `<span class="badge ok">on</span> <span class="muted small mono">${esc(settings.vuln_endpoint || '')}</span>`
-          : '<span class="badge">off</span>'}</dd>
         <dt>Webhooks</dt><dd>${settings.webhooks_enabled ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}</dd>
         <dt>Pull-through cache</dt><dd>${settings.proxy_remote
           ? `<span class="badge ok">on</span> <span class="mono small">${esc(settings.proxy_remote)}</span> under <code>${esc(settings.proxy_prefix || '')}</code>`

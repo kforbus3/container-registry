@@ -211,7 +211,7 @@ func TestSubscribes(t *testing.T) {
 		{db.EventPushTag, db.EventPushTag, true},
 		{db.EventPushTag, db.EventDeleteTag, false},
 		{"push.tag, delete.tag", db.EventDeleteTag, true},
-		{"push.tag, delete.tag", db.EventScanComplete, false},
+		{"push.tag, delete.tag", db.EventPushManifest, false},
 	}
 	for _, c := range cases {
 		w := &db.Webhook{Events: c.events}

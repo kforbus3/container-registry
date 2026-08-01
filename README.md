@@ -9,6 +9,21 @@ automatically described by a CycloneDX SBOM, published back as an OCI referrer.
 Single Go binary, embedded web UI, SQLite metadata, and blobs on local disk or
 any S3-compatible object store. No external services required.
 
+> **This is the `no-vuln-scanning` branch.** Vulnerability scanning has been
+> removed outright, not merely disabled. On `main`, every pushed image had its
+> package inventory — the name, ecosystem and version of every installed package
+> — sent to the public OSV.dev API, and that was on by default. No repository
+> name, image name, digest or username was ever included, but the inventory
+> itself discloses what software you run and how current your patching is.
+>
+> This build has no code that can reach a third party: the scanner, the OSV
+> client and the advisory cache are gone, along with their API endpoints, UI and
+> database tables. **SBOM generation is unaffected** — it reads the layers you
+> pushed and never leaves the process. The only outbound connections this build
+> can make are to endpoints you configure yourself: your object store, your
+> webhook receivers, and an upstream registry if you enable the pull-through
+> cache.
+
 ```
 $ make conformance
   Tag listing.......: Pass      Manifest put by digest..: Pass
@@ -149,16 +164,6 @@ this registry.
   distroless images that have no package database at all
 - Runs on background workers; a push is never delayed or failed by it
 
-**Vulnerability scanning**
-
-- Each SBOM is matched against [OSV.dev](https://osv.dev) — free, no credentials,
-  and covering every ecosystem the SBOM scanner detects
-- Severity from the CVSS v3 vector computed in-registry rather than taken from a
-  vendor label, because the same CVE is rated differently by different databases
-- Fixed-version reported per finding, which is the part anyone can act on
-- Per-tag risk in the repository listing, findings and re-scan on the image page
-- Advisories are cached and shared across images, with a freshness bound
-
 **Access control**
 
 - Users with `admin`/`user` roles; the last administrator cannot be removed
@@ -174,7 +179,7 @@ this registry.
 
 **Webhooks**
 
-- Signed deliveries on push, delete and scan-complete, with per-hook event
+- Signed deliveries on push and delete, with per-hook event
   filters and registry-wide or per-repository scope
 - HMAC-SHA256 over timestamp and body, so a receiver can verify the delivery
   came from the registry and a captured one cannot be replayed forever
@@ -225,12 +230,6 @@ All configuration is by environment variable.
 | `REGISTRY_SBOM` | `true` | Generate an SBOM for each pushed image |
 | `REGISTRY_SBOM_WORKERS` | `2` | Concurrent image scans |
 | `REGISTRY_SBOM_QUEUE` | `256` | Backlog depth before jobs are dropped |
-| `REGISTRY_VULN_SCAN` | `true` | Match each SBOM against an advisory database |
-| `REGISTRY_VULN_ENDPOINT` | `https://api.osv.dev` | OSV-compatible API; point at a mirror to avoid egress |
-| `REGISTRY_VULN_WORKERS` | `2` | Concurrent scans |
-| `REGISTRY_VULN_QUEUE` | `256` | Backlog depth before scans are dropped |
-| `REGISTRY_VULN_TIMEOUT` | `60s` | Per-request timeout to the advisory service |
-| `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused, and how long an unreferenced one is kept |
 | `REGISTRY_MAINTENANCE_INTERVAL` | `6h` | How often retention and collection run; `0` disables |
 | `REGISTRY_MAINTENANCE_DELAY` | `5m` | Delay before the first scheduled sweep |
 | `REGISTRY_RATE_LIMIT` | `0` | Requests per minute per caller; `0` disables |
@@ -332,8 +331,6 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` | `/api/repositories/<name>/manifests/<digest>` | Manifest, layers, image config, history |
 | `DELETE` | `/api/repositories/<name>/manifests/<digest>` | Delete a manifest and its tags |
 | `GET` | `/api/repositories/<name>/manifests/<digest>/sbom` | Download the generated CycloneDX SBOM (`?platform=os/arch` for a multi-platform index) |
-| `GET` | `/api/repositories/<name>/manifests/<digest>/vulnerabilities` | Findings for an image, worst first |
-| `POST` | `/api/repositories/<name>/manifests/<digest>/rescan` | Re-check against current advisories |
 | `GET` `POST` | `/api/tokens` | List / create tokens |
 | `POST` | `/api/tokens/<id>/revoke` | Revoke a token |
 | `DELETE` | `/api/tokens/<id>` | Delete a token record |
@@ -490,45 +487,6 @@ free.
 
 ---
 
-## Vulnerability scanning
-
-Publishing an SBOM schedules a scan. Package URLs are matched against
-[OSV.dev](https://osv.dev), and the result is stored per image manifest:
-
-```bash
-curl -u admin:PASSWORD \
-  http://localhost:5001/api/repositories/team-a/app/manifests/<digest>/vulnerabilities
-```
-
-Severity is computed from the advisory's CVSS v3 vector rather than taken from a
-vendor's own label, because the same CVE is routinely rated differently by
-different databases and only the vector is common to all of them. Where no
-usable vector exists the database's qualitative rating is used, and where
-neither exists the finding is reported as `UNKNOWN` rather than assumed benign.
-
-**Accuracy.** Two things had to be handled to avoid reporting nonsense:
-
-- OSV indexes operating-system packages by ecosystem name and language packages
-  by package URL. A purl query for an Alpine or Debian package returns *nothing*
-  — not an error — so getting this wrong reads as "no vulnerabilities". Each
-  component is sent in whichever shape actually finds it.
-- Red Hat's advisories are published under an ecosystem that is not split by
-  release, so a query matches every RHEL major version at once. Left alone, a
-  current UBI 8 image reported 463 high-severity findings, none with a fix.
-  Red Hat findings are now verified against the advisory's own affected ranges
-  using RPM version comparison — including the epoch, which lives in a purl
-  qualifier and outranks everything else. The same image now reports 11.
-
-**What it does not do.** It reports on what the SBOM found, so its coverage is
-the SBOM's coverage. Distribution-backported fixes are a known source of
-over-reporting for language packages bundled by a distribution: RHEL ships
-`urllib3 1.24.2` with fixes backported, but the upstream PyPI feed only knows
-the version number. Findings are advisory matches, not exploitability
-judgements. A failed scan is recorded as failed and shown as such, because
-"could not check" must never render as "clean".
-
----
-
 ## Token authentication
 
 HTTP Basic is the default and works with every client tested here. Setting
@@ -631,7 +589,7 @@ unbounded cardinality, which is the usual way a metrics endpoint becomes the
 most expensive thing in a system.
 
 Gauges cover repositories, tags, manifests, blobs, storage bytes, images
-scanned and open findings by severity, plus SBOM and webhook activity.
+plus SBOM and webhook activity.
 
 The endpoint is unauthenticated by default, because that is what every scraper
 expects and the values are counts rather than content. Set
@@ -667,7 +625,7 @@ curl -u admin:PASSWORD -X POST http://localhost:5001/api/webhooks \
 ```
 
 Events: `push.tag`, `push.manifest`, `delete.tag`, `delete.manifest`,
-`scan.complete`, `retention.delete_tag`. Omit `events` or use `*` for all of
+`retention.delete_tag`. Omit `events` or use `*` for all of
 them. Adding `"repository"` scopes the hook to one repository instead of the
 whole registry.
 

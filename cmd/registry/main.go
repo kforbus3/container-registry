@@ -23,7 +23,6 @@ import (
 	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
-	"github.com/kforbus3/container-registry/internal/vuln"
 	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
@@ -115,43 +114,10 @@ func run() error {
 		log.Info("webhooks enabled", "workers", cfg.WebhookWorkers)
 	}
 
-	// Vulnerability scanning consumes the SBOMs, so it is started first and
-	// chained to the generator below.
-	var scanner *vuln.Scanner
-	if cfg.VulnEnabled {
-		scanner = vuln.New(database, st,
-			vuln.NewClient(cfg.VulnEndpoint, cfg.VulnTimeout), log, cfg.VulnQueueDepth)
-		scanner.AdvisoryTTL = cfg.VulnAdvisoryTTL
-		if hooks != nil {
-			// A completed scan is the event people actually want to gate on.
-			scanner.OnComplete = func(repoID int64, repoName, digest string, critical, high int) {
-				hooks.Emit(webhook.Event{
-					Event: db.EventScanComplete, RepoID: repoID,
-					Repository: repoName, Digest: digest, Actor: "registry",
-					Data: map[string]any{"critical": critical, "high": high},
-				})
-			}
-		}
-		scanner.Start(ctx, cfg.VulnWorkers)
-		srv.SetVulnScanner(scanner)
-		defer scanner.Wait()
-		log.Info("vulnerability scanning enabled",
-			"endpoint", cfg.VulnEndpoint, "workers", cfg.VulnWorkers)
-	}
-
 	// Automatic SBOM generation. Workers run for the life of the process and
 	// drain on shutdown.
 	if cfg.SBOMEnabled {
 		generator := sbom.New(database, st, log, cfg.SBOMWorkers, cfg.SBOMQueueDepth)
-		if scanner != nil {
-			// A new bill of materials is exactly when its packages should be
-			// checked, so the scan follows publication rather than polling.
-			generator.OnPublished = func(job sbom.Job) {
-				scanner.Enqueue(vuln.Job{
-					RepoID: job.RepoID, RepoName: job.RepoName, Digest: job.Digest,
-				})
-			}
-		}
 		generator.Start(ctx, cfg.SBOMWorkers)
 		srv.SetSBOMGenerator(generator)
 		defer generator.Wait()
@@ -168,9 +134,6 @@ func run() error {
 		Log:          log,
 		Interval:     cfg.MaintenanceInterval,
 		InitialDelay: cfg.MaintenanceDelay,
-		// Past this the advisory would be refetched anyway, so an unreferenced
-		// one is not worth the several kilobytes its document occupies.
-		AdvisoryTTL: cfg.VulnAdvisoryTTL,
 	}
 	srv.SetScheduler(scheduler)
 	go scheduler.Run(ctx)

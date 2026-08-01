@@ -316,6 +316,21 @@ CREATE INDEX idx_grants_user ON repo_grants(user_id);
 -- and a fresh fetch produce identical findings.
 ALTER TABLE vuln_advisories ADD COLUMN document TEXT NOT NULL DEFAULT '';
 `},
+
+	{"008_drop_vulnerability_scanning", `
+-- This build has no vulnerability scanning, so the tables it filled are dead
+-- weight -- and the advisory cache in particular holds several kilobytes per
+-- record of data fetched from a third party.
+--
+-- Migrations 002 and 007 are left in place rather than edited out: a registry
+-- upgrading into this build has already applied them, and rewriting applied
+-- history would leave its schema_migrations disagreeing with its schema. A
+-- fresh database creates these tables and drops them again, which costs
+-- nothing and keeps both paths identical.
+DROP TABLE IF EXISTS vuln_findings;
+DROP TABLE IF EXISTS vuln_scans;
+DROP TABLE IF EXISTS vuln_advisories;
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

@@ -15,14 +15,13 @@ const (
 	EventPushManifest   = "push.manifest"
 	EventDeleteTag      = "delete.tag"
 	EventDeleteManifest = "delete.manifest"
-	EventScanComplete   = "scan.complete"
 	EventRetentionTag   = "retention.delete_tag"
 )
 
 // AllEvents lists every event a webhook can subscribe to.
 var AllEvents = []string{
 	EventPushTag, EventPushManifest, EventDeleteTag,
-	EventDeleteManifest, EventScanComplete, EventRetentionTag,
+	EventDeleteManifest, EventRetentionTag,
 }
 
 // Webhook is a registered delivery target.

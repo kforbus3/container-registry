@@ -24,10 +24,6 @@ type Scheduler struct {
 	// InitialDelay staggers the first run so a restart loop cannot turn into a
 	// collection loop.
 	InitialDelay time.Duration
-
-	// AdvisoryTTL bounds how long an unreferenced cached advisory is kept.
-	// Zero leaves the advisory cache alone.
-	AdvisoryTTL time.Duration
 }
 
 // Run blocks until the context is cancelled, sweeping on the interval.
@@ -75,14 +71,6 @@ func (s *Scheduler) Sweep(ctx context.Context, trigger string) {
 			StartedAt:   started,
 			DurationMS:  time.Since(started).Milliseconds(),
 		})
-	}
-
-	// The advisory cache is swept here too: it is storage that grows on its
-	// own, which is exactly what this sweep exists to bound.
-	if n, err := s.DB.PruneAdvisories(ctx, s.AdvisoryTTL); err != nil {
-		s.Log.Error("advisory cache prune failed", "err", err)
-	} else if n > 0 {
-		s.Log.Info("pruned unreferenced advisories", "count", n)
 	}
 
 	gcStart := time.Now()

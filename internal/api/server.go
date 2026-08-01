@@ -25,7 +25,6 @@ import (
 	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
-	"github.com/kforbus3/container-registry/internal/vuln"
 	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
@@ -40,7 +39,6 @@ type Server struct {
 
 	collector *gc.Collector
 	sbom      *sbom.Generator
-	vuln      *vuln.Scanner
 	scheduler *gc.Scheduler
 	retention *gc.Retention
 
@@ -431,15 +429,6 @@ func (s *Server) refreshGauges(r *http.Request) {
 		s.Metrics.SetGauge("registry_storage_bytes", "Bytes referenced by live manifests.", nil, float64(st.SizeBytes))
 		s.Metrics.SetGauge("registry_users", "User accounts.", nil, float64(st.Users))
 		s.Metrics.SetGauge("registry_tokens_active", "Tokens that have not been revoked.", nil, float64(st.ActiveTokens))
-	}
-	if vs, err := s.DB.VulnStats(r.Context()); err == nil {
-		s.Metrics.SetGauge("registry_images_scanned", "Images checked against an advisory database.", nil, float64(vs.Scanned))
-		for severity, n := range map[string]int{
-			"critical": vs.Critical, "high": vs.High, "medium": vs.Medium, "low": vs.Low,
-		} {
-			s.Metrics.SetGauge("registry_vulnerabilities",
-				"Open findings by severity.", metrics.Labels{"severity": severity}, float64(n))
-		}
 	}
 	if s.sbom != nil {
 		st := s.sbom.Stats()
