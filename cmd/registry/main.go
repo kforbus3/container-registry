@@ -118,6 +118,19 @@ func run() error {
 			"workers", cfg.SBOMWorkers, "queue", cfg.SBOMQueueDepth)
 	}
 
+	// Retention decides what is no longer wanted; collection frees it. Running
+	// them on a schedule is what stops storage growing without bound.
+	scheduler := &gc.Scheduler{
+		DB:           database,
+		Retention:    &gc.Retention{DB: database},
+		Collector:    collector,
+		Log:          log,
+		Interval:     cfg.MaintenanceInterval,
+		InitialDelay: cfg.MaintenanceDelay,
+	}
+	srv.SetScheduler(scheduler)
+	go scheduler.Run(ctx)
+
 	go janitor(ctx, database, st, cfg.GCUploadTTL, log)
 
 	errCh := make(chan error, 1)

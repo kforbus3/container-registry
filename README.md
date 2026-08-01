@@ -166,6 +166,9 @@ referrer attached by ORAS, discovered back through the referrers API.
   history, token issue/revoke, user management, audit log, garbage collection
 - Mark-and-sweep garbage collection with a dry-run mode and a configurable
   grace period that protects in-flight pushes
+- Retention rules per repository — keep the newest N, delete older than a
+  duration, protect tag patterns — applied on a schedule alongside collection,
+  with a preview that shows every decision and its reason before anything runs
 
 ---
 
@@ -196,6 +199,8 @@ All configuration is by environment variable.
 | `REGISTRY_VULN_QUEUE` | `256` | Backlog depth before scans are dropped |
 | `REGISTRY_VULN_TIMEOUT` | `60s` | Per-request timeout to the advisory service |
 | `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused |
+| `REGISTRY_MAINTENANCE_INTERVAL` | `6h` | How often retention and collection run; `0` disables |
+| `REGISTRY_MAINTENANCE_DELAY` | `5m` | Delay before the first scheduled sweep |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -280,6 +285,11 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `PATCH` `DELETE` | `/api/users/<id>` | Update / delete a user *(admin)* |
 | `GET` | `/api/audit` | Audit log *(admin)* |
 | `GET` `POST` | `/api/gc` | Status / run garbage collection *(admin)* |
+| `GET` `POST` | `/api/repositories/<name>/retention` | List / create retention rules |
+| `PATCH` `DELETE` | `/api/repositories/<name>/retention/<id>` | Enable / remove a rule |
+| `POST` | `/api/retention/preview` | Show what a sweep would delete *(admin)* |
+| `GET` | `/api/maintenance` | Scheduled-run history *(admin)* |
+| `POST` | `/api/maintenance/sweep` | Run retention and collection now *(admin)* |
 | `GET` | `/api/settings` | Effective configuration *(admin)* |
 | `GET` | `/healthz` | Liveness probe, no auth |
 
@@ -457,7 +467,38 @@ judgements. A failed scan is recorded as failed and shown as such, because
 
 ---
 
-## Garbage collection
+## Retention and garbage collection
+
+Retention decides what is no longer wanted; collection frees the space. They run
+together on `REGISTRY_MAINTENANCE_INTERVAL` (six hours by default), because
+storage otherwise only grows — collection used to run when somebody remembered
+to ask for it, which is not a maintenance strategy.
+
+Rules are per repository and opt-in: **a repository with no rules keeps
+everything**, so enabling the scheduler changes nothing on its own.
+
+```bash
+# keep only the ten newest nightly builds
+curl -u admin:PASSWORD -X POST \
+  http://localhost:5001/api/repositories/team-a/app/retention \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"keep_last","pattern":"nightly-*","keep_count":10}'
+
+# never remove a production tag, whatever any other rule says
+curl -u admin:PASSWORD -X POST \
+  http://localhost:5001/api/repositories/team-a/app/retention \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"protect","pattern":"prod-*"}'
+
+# what would a sweep do right now?
+curl -u admin:PASSWORD -X POST http://localhost:5001/api/retention/preview
+```
+
+The preview names every tag it would remove and why, because retention deletes
+permanently and that decision should be readable before it is trusted.
+Protection is evaluated first and always wins. A malformed duration is ignored
+rather than treated as "everything has expired", so a typo cannot empty a
+repository.
 
 Deleting a tag or a manifest removes the reference, not the bytes. Run a
 collection to reclaim disk:

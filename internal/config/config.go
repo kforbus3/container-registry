@@ -53,6 +53,11 @@ type Config struct {
 	VulnTimeout time.Duration
 	// VulnAdvisoryTTL is how long a cached advisory is reused before refetch.
 	VulnAdvisoryTTL time.Duration
+	// MaintenanceInterval is how often retention and collection run on their
+	// own. Zero disables scheduling, leaving both on-demand only.
+	MaintenanceInterval time.Duration
+	// MaintenanceDelay staggers the first scheduled sweep after start-up.
+	MaintenanceDelay time.Duration
 }
 
 func Load() (*Config, error) {
@@ -92,6 +97,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.VulnAdvisoryTTL, err = envDuration("REGISTRY_VULN_ADVISORY_TTL", 24*time.Hour); err != nil {
+		return nil, err
+	}
+	if c.MaintenanceInterval, err = envDuration("REGISTRY_MAINTENANCE_INTERVAL", 6*time.Hour); err != nil {
+		return nil, err
+	}
+	if c.MaintenanceDelay, err = envDuration("REGISTRY_MAINTENANCE_DELAY", 5*time.Minute); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {

@@ -465,10 +465,74 @@ async function renderRepo(view, [name]) {
     </div>` : ''}
 
     <div class="card">
+      <h2>Retention <span class="badge">${(data.retention || []).length} rules</span></h2>
+      <p class="muted small" style="margin-top:-.4rem">
+        With no rules, nothing is ever removed automatically.</p>
+      ${tableOrEmpty((data.retention || []).map((rr) => `<tr>
+        <td><span class="badge ${rr.kind === 'protect' ? 'ok' : 'warn'}">${esc(rr.kind)}</span></td>
+        <td class="mono small">${esc(rr.pattern)}</td>
+        <td class="small">${rr.kind === 'keep_last' ? `keep ${rr.keep_count}`
+            : rr.kind === 'delete_older_than' ? `older than ${esc(rr.max_age)}` : '—'}</td>
+        <td>${rr.enabled ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}</td>
+        <td class="actions">${canDelete ? `<button class="btn ghost small danger"
+          onclick="deleteRule('${jsq(repo.name)}',${rr.id})">Remove</button>` : ''}</td>
+      </tr>`), '<tr><th>Rule</th><th>Pattern</th><th>Setting</th><th></th><th></th></tr>',
+        'No retention rules — this repository keeps everything.')}
+      ${canDelete ? `<div class="row" style="margin-top:.8rem">
+        <button class="btn" onclick="addRule('${jsq(repo.name)}')">Add rule</button>
+      </div>` : ''}
+    </div>
+
+    <div class="card">
       <h2>Pull this image</h2>
       <pre>docker pull ${esc(host)}/${esc(repo.name)}:${esc(tags[0] ? tags[0].name : 'latest')}</pre>
     </div>`;
 }
+
+window.addRule = async (repo) => {
+  const v = await modal({
+    title: `Retention rule for ${repo}`,
+    okLabel: 'Add rule',
+    bodyHTML: `
+      <div class="field"><label>Rule</label>
+        <select name="kind">
+          <option value="keep_last">Keep only the newest N tags</option>
+          <option value="delete_older_than">Delete tags older than…</option>
+          <option value="protect">Never delete matching tags</option>
+        </select></div>
+      <div class="field"><label>Tag pattern</label>
+        <input name="pattern" value="*" placeholder="*">
+        <span class="hint">Globs, comma-separated: <code>nightly-*, dev-*</code></span></div>
+      <div class="field"><label>Keep how many</label>
+        <input name="keep_count" type="number" min="1" value="10">
+        <span class="hint">Used by "keep the newest N".</span></div>
+      <div class="field"><label>Maximum age</label>
+        <input name="max_age" placeholder="720h">
+        <span class="hint">Used by "older than": a duration such as <code>720h</code>.</span></div>`,
+  });
+  if (!v) return;
+  try {
+    await api(`/repositories/${encodeURI(repo)}/retention`, {
+      method: 'POST',
+      body: JSON.stringify({
+        kind: v.kind, pattern: v.pattern,
+        keep_count: parseInt(v.keep_count, 10) || 0,
+        max_age: v.max_age,
+      }),
+    });
+    toast('Rule added', 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.deleteRule = async (repo, id) => {
+  if (!await confirmDanger('Remove rule', 'Remove this retention rule?', 'Remove')) return;
+  try {
+    await api(`/repositories/${encodeURI(repo)}/retention/${id}`, { method: 'DELETE' });
+    toast('Rule removed', 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
 
 window.deleteTag = async (repo, tag) => {
   if (!await confirmDanger('Delete tag', `Delete tag "${tag}" from ${repo}? The manifest stays until garbage collection runs.`)) return;
@@ -1015,8 +1079,8 @@ async function renderAudit(view) {
 // ---- maintenance
 
 async function renderMaintenance(view) {
-  const [gcState, settings, stats] = await Promise.all([
-    api('/gc'), api('/settings'), api('/stats'),
+  const [gcState, settings, stats, maint] = await Promise.all([
+    api('/gc'), api('/settings'), api('/stats'), api('/maintenance'),
   ]);
   const last = gcState.last;
 
@@ -1055,6 +1119,32 @@ async function renderMaintenance(view) {
     </div>
 
     <div class="card">
+      <h2>Scheduled maintenance</h2>
+      <p class="muted small" style="margin-top:-.4rem">
+        Retention decides what is no longer wanted; collection frees the space.
+        They run together on a schedule so storage does not grow without bound.</p>
+      <dl class="kv">
+        <dt>Interval</dt><dd>${esc(maint.interval || 'disabled')}</dd>
+        <dt>Recent runs</dt><dd>${(maint.runs || []).length}</dd>
+      </dl>
+      <div class="row" style="margin-top:.8rem">
+        <button class="btn" onclick="retentionPreview()">Preview retention</button>
+        <button class="btn primary" onclick="sweepNow()">Run maintenance now</button>
+      </div>
+      ${(maint.runs || []).length ? `<div class="table-wrap" style="margin-top:1rem">
+        <table><thead><tr><th>When</th><th>Kind</th><th>Trigger</th>
+          <th class="num">Tags</th><th class="num">Blobs</th><th class="num">Freed</th></tr></thead>
+        <tbody>${maint.runs.slice(0, 10).map((r) => `<tr>
+          <td class="muted small" title="${esc(fullDate(r.started_at))}">${esc(ago(r.started_at))}</td>
+          <td><span class="badge">${esc(r.kind)}</span></td>
+          <td class="muted small">${esc(r.trigger)}</td>
+          <td class="num">${r.tags_deleted || ''}</td>
+          <td class="num">${r.blobs_deleted || ''}</td>
+          <td class="num">${r.bytes_freed ? esc(bytes(r.bytes_freed)) : ''}</td>
+        </tr>`).join('')}</tbody></table></div>` : ''}
+    </div>
+
+    <div class="card">
       <h2>Configuration</h2>
       <dl class="kv">
         <dt>Listen address</dt><dd class="mono">${esc(settings.addr)}</dd>
@@ -1070,6 +1160,42 @@ async function renderMaintenance(view) {
         These come from environment variables and are fixed for the life of the process.</p>
     </div>`;
 }
+
+window.retentionPreview = async () => {
+  try {
+    const res = await api('/retention/preview', { method: 'POST' });
+    const rows = (res.decisions || []).map((d) => `<tr>
+      <td>${esc(d.repository)}</td>
+      <td><strong>${esc(d.tag)}</strong></td>
+      <td>${d.delete ? '<span class="badge danger">delete</span>'
+                     : '<span class="badge ok">protected</span>'}</td>
+      <td class="muted small">${esc(d.reason)}</td>
+    </tr>`);
+    await modal({
+      title: `Retention preview — ${res.tags_deleted} of ${res.tags_examined} tags`,
+      okLabel: 'Close',
+      dismissOnly: true,
+      bodyHTML: `<p class="muted small">Nothing has been deleted. This is what a
+        sweep would do right now.</p>
+        <div style="max-height:55vh;overflow:auto">
+        ${tableOrEmpty(rows, '<tr><th>Repository</th><th>Tag</th><th></th><th>Reason</th></tr>',
+          'No rules match anything — nothing would be removed.')}
+        </div>`,
+    });
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.sweepNow = async () => {
+  if (!await confirmDanger('Run maintenance',
+    'Apply retention rules and then collect unreferenced blobs? Deletions are permanent.',
+    'Run')) return;
+  toast('Sweeping…');
+  try {
+    await api('/maintenance/sweep', { method: 'POST' });
+    toast('Maintenance complete', 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
 
 window.runGC = async (dryRun) => {
   if (!dryRun && !await confirmDanger('Run garbage collection',

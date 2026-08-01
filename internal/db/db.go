@@ -217,6 +217,40 @@ CREATE TABLE vuln_advisories (
 	fetched_at TEXT NOT NULL
 );
 `},
+
+	{"003_retention", `
+-- Retention rules are per repository. A repository with no rows keeps
+-- everything, so the feature is opt-in and an upgrade changes nothing.
+CREATE TABLE retention_rules (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_id     INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+	kind        TEXT    NOT NULL,   -- keep_last | delete_older_than | keep_matching
+	pattern     TEXT    NOT NULL DEFAULT '*',
+	keep_count  INTEGER NOT NULL DEFAULT 0,
+	max_age     TEXT    NOT NULL DEFAULT '',
+	-- Tags matching a protected pattern are never removed by any rule.
+	protect     INTEGER NOT NULL DEFAULT 0,
+	enabled     INTEGER NOT NULL DEFAULT 1,
+	created_at  TEXT    NOT NULL
+);
+CREATE INDEX idx_retention_repo ON retention_rules(repo_id);
+
+-- A record of what maintenance actually did, so a scheduled run that deletes
+-- something can be explained after the fact.
+CREATE TABLE maintenance_runs (
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	kind          TEXT    NOT NULL,  -- retention | gc
+	trigger       TEXT    NOT NULL,  -- schedule | manual
+	dry_run       INTEGER NOT NULL DEFAULT 0,
+	tags_deleted  INTEGER NOT NULL DEFAULT 0,
+	blobs_deleted INTEGER NOT NULL DEFAULT 0,
+	bytes_freed   INTEGER NOT NULL DEFAULT 0,
+	detail        TEXT    NOT NULL DEFAULT '',
+	started_at    TEXT    NOT NULL,
+	duration_ms   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_maintenance_started ON maintenance_runs(started_at DESC);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

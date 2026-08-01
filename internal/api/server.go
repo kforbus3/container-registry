@@ -33,6 +33,8 @@ type Server struct {
 	collector *gc.Collector
 	sbom      *sbom.Generator
 	vuln      *vuln.Scanner
+	scheduler *gc.Scheduler
+	retention *gc.Retention
 }
 
 // urlPathUnescape is a thin alias so admin.go does not import net/url directly.

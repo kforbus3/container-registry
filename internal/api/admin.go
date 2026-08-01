@@ -28,6 +28,12 @@ func (s *Server) SetSBOMGenerator(g *sbom.Generator) { s.sbom = g }
 // SetVulnScanner wires in vulnerability scanning. A nil scanner disables it.
 func (s *Server) SetVulnScanner(v *vuln.Scanner) { s.vuln = v }
 
+// SetScheduler wires in scheduled maintenance and the retention engine it uses.
+func (s *Server) SetScheduler(sc *gc.Scheduler) {
+	s.scheduler = sc
+	s.retention = sc.Retention
+}
+
 // adminRouter serves the management API mounted at /api.
 func (s *Server) adminRouter() http.Handler {
 	mux := http.NewServeMux()
@@ -55,6 +61,10 @@ func (s *Server) adminRouter() http.Handler {
 	mux.Handle("POST /gc", s.requireAdmin(s.handleGCRun))
 
 	mux.Handle("GET /settings", s.requireAdmin(s.handleSettingsGet))
+
+	mux.Handle("GET /maintenance", s.requireAdmin(s.handleMaintenanceHistory))
+	mux.Handle("POST /maintenance/sweep", s.requireAdmin(s.handleMaintenanceSweep))
+	mux.Handle("POST /retention/preview", s.requireAdmin(s.handleRetentionPreview))
 
 	// Repository paths contain slashes, so this subtree is routed by hand.
 	mux.Handle("/repositories", s.requireAuth(s.handleRepoList))
@@ -624,6 +634,164 @@ func validUsername(s string) bool {
 	return true
 }
 
+// ---------------------------------------------------------------- retention
+
+// mustRetentionRules returns a repository's rules, or an empty list if they
+// cannot be read: the repository page should still render.
+func mustRetentionRules(r *http.Request, s *Server, repoID int64) []*db.RetentionRule {
+	rules, err := s.DB.RetentionRules(r.Context(), repoID)
+	if err != nil {
+		return []*db.RetentionRule{}
+	}
+	return rules
+}
+
+// repoRetention lists or creates retention rules for a repository.
+func (s *Server) repoRetention(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	p := principalFrom(r.Context())
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.DB.RetentionRules(r.Context(), repo.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to list retention rules")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
+
+	case http.MethodPost:
+		if !p.CanDeleteRepo(repo.Name) {
+			writeErr(w, http.StatusForbidden,
+				"delete permission is required to configure retention")
+			return
+		}
+		var req struct {
+			Kind      string `json:"kind"`
+			Pattern   string `json:"pattern"`
+			KeepCount int    `json:"keep_count"`
+			MaxAge    string `json:"max_age"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.Pattern == "" {
+			req.Pattern = "*"
+		}
+		switch req.Kind {
+		case db.RetentionKeepLast:
+			if req.KeepCount <= 0 {
+				writeErr(w, http.StatusBadRequest, "keep_count must be greater than zero")
+				return
+			}
+		case db.RetentionMaxAge:
+			d, err := time.ParseDuration(req.MaxAge)
+			if err != nil || d <= 0 {
+				writeErr(w, http.StatusBadRequest,
+					`max_age must be a positive duration such as "720h"`)
+				return
+			}
+		case db.RetentionProtect:
+		default:
+			writeErr(w, http.StatusBadRequest,
+				"kind must be keep_last, delete_older_than or protect")
+			return
+		}
+		rule, err := s.DB.CreateRetentionRule(r.Context(), &db.RetentionRule{
+			RepoID: repo.ID, Kind: req.Kind, Pattern: req.Pattern,
+			KeepCount: req.KeepCount, MaxAge: req.MaxAge, Enabled: true,
+		})
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to create rule")
+			return
+		}
+		s.audit(r, "retention.create", repo.Name, req.Kind, req.Pattern)
+		writeJSON(w, http.StatusCreated, rule)
+
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) repoRetentionRule(w http.ResponseWriter, r *http.Request, repo *db.Repository, idStr string) {
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid rule id")
+		return
+	}
+	if !principalFrom(r.Context()).CanDeleteRepo(repo.Name) {
+		writeErr(w, http.StatusForbidden, "delete permission is required")
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		if err := s.DB.DeleteRetentionRule(r.Context(), repo.ID, id); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to delete rule")
+			return
+		}
+		s.audit(r, "retention.delete", repo.Name, idStr, "")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	case http.MethodPatch:
+		var req struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := decodeJSON(r, &req); err != nil || req.Enabled == nil {
+			writeErr(w, http.StatusBadRequest, "enabled is required")
+			return
+		}
+		if err := s.DB.SetRetentionRuleEnabled(r.Context(), repo.ID, id, *req.Enabled); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to update rule")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleRetentionPreview shows what a sweep would delete without deleting it.
+// Retention removes things permanently, so it must be possible to read the
+// decision before trusting it.
+func (s *Server) handleRetentionPreview(w http.ResponseWriter, r *http.Request) {
+	if s.retention == nil {
+		writeErr(w, http.StatusServiceUnavailable, "retention is not configured")
+		return
+	}
+	res, err := s.retention.ApplyAll(r.Context(), true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "preview failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleMaintenanceHistory(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	runs, err := s.DB.MaintenanceRuns(r.Context(), limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read history")
+		return
+	}
+	interval := ""
+	if s.scheduler != nil {
+		interval = s.scheduler.Interval.String()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runs":     runs,
+		"interval": interval,
+	})
+}
+
+// handleMaintenanceSweep runs retention and collection immediately.
+func (s *Server) handleMaintenanceSweep(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeErr(w, http.StatusServiceUnavailable, "scheduled maintenance is not configured")
+		return
+	}
+	s.scheduler.Sweep(r.Context(), "manual")
+	s.audit(r, "maintenance.sweep", "", "", "manual")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "swept"})
+}
+
 // ---------------------------------------------------------------- gc & settings
 
 func (s *Server) handleGCStatus(w http.ResponseWriter, r *http.Request) {
@@ -693,10 +861,17 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 	}
 	segments := strings.Split(rest, "/")
 
+	// Repository names contain slashes, so the path is split on the last
+	// routing verb. Every sub-resource must be listed here: one that is missing
+	// gets swallowed into the repository name and reported as "no such
+	// repository", which is a confusing way to say "unrouted".
 	verbIdx := -1
 	for i := len(segments) - 1; i > 0; i-- {
-		if segments[i] == "tags" || segments[i] == "manifests" {
+		switch segments[i] {
+		case "tags", "manifests", "retention":
 			verbIdx = i
+		}
+		if verbIdx >= 0 {
 			break
 		}
 	}
@@ -734,6 +909,10 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 		s.repoRoot(w, r, repo)
 	case len(tail) == 1 && tail[0] == "tags":
 		s.repoTags(w, r, repo)
+	case len(tail) == 1 && tail[0] == "retention":
+		s.repoRetention(w, r, repo)
+	case len(tail) == 2 && tail[0] == "retention":
+		s.repoRetentionRule(w, r, repo, tail[1])
 	case len(tail) == 2 && tail[0] == "tags":
 		s.repoTag(w, r, repo, tail[1])
 	case len(tail) == 3 && tail[0] == "manifests" && tail[2] == "sbom":
