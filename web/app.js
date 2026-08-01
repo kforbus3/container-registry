@@ -1328,6 +1328,192 @@ async function renderAudit(view) {
 
 // ---- maintenance
 
+/* ------------------------------------------------------------ storage config
+
+Changing where blobs live is the one setting that cannot be applied by writing
+it down: the bytes already stored do not move themselves. So the form saves a
+target, and moving to it is a separate migration that copies every blob and
+verifies each one before the registry starts reading from the new backend. */
+
+function storageFormHTML(st) {
+  const s3 = st.kind === 's3';
+  return `
+    <h3>Change where blobs are stored</h3>
+    <div class="field">
+      <label>Backend</label>
+      <select id="sb-kind" onchange="storageKindChanged()">
+        <option value="filesystem" ${s3 ? '' : 'selected'}>Local filesystem</option>
+        <option value="s3" ${s3 ? 'selected' : ''}>S3-compatible object store</option>
+      </select>
+      <span class="hint">Any S3-compatible store works: AWS, MinIO, Ceph RADOS
+        Gateway, Backblaze B2, Cloudflare R2.</span>
+    </div>
+    <div id="sb-s3" ${s3 ? '' : 'hidden'}>
+      <div class="field"><label>Endpoint</label>
+        <input id="sb-endpoint" value="${esc(st.endpoint || '')}"
+               placeholder="http://minio:9000">
+        <span class="hint">Leave blank for AWS, which is derived from the region.</span></div>
+      <div class="field"><label>Bucket</label>
+        <input id="sb-bucket" value="${esc(st.bucket || '')}" placeholder="registry-blobs"></div>
+      <div class="field"><label>Region</label>
+        <input id="sb-region" value="${esc(st.region || '')}" placeholder="us-east-1"></div>
+      <div class="field"><label>Key prefix</label>
+        <input id="sb-prefix" value="${esc(st.prefix || '')}" placeholder="production">
+        <span class="hint">Optional, so one bucket can hold several registries.</span></div>
+      <div class="field"><label>Access key</label>
+        <input id="sb-access" value="" placeholder="${esc(st.access_key || 'AKIA…')}"></div>
+      <div class="field"><label>Secret key</label>
+        <input id="sb-secret" type="password" value="" placeholder="leave blank to keep the saved one">
+        <span class="hint">Stored encrypted, in a key file beside the database
+          rather than in it. Never returned by the API.</span></div>
+      <div class="field"><label>Addressing</label>
+        <select id="sb-pathstyle">
+          <option value="true" ${st.path_style === false ? '' : 'selected'}>Path style (MinIO, most gateways)</option>
+          <option value="false" ${st.path_style === false ? 'selected' : ''}>Virtual host style (AWS)</option>
+        </select></div>
+    </div>
+    <div class="row" style="margin-top:.8rem">
+      <button class="btn primary" onclick="saveStorage(this)">Test and save</button>
+      <button class="btn ghost" onclick="toggleStorageForm()">Cancel</button>
+    </div>
+    <p class="muted small" style="margin-top:.7rem">
+      The settings are checked against the real backend before being saved — a
+      write, a read back and a delete — so a wrong bucket or key fails here
+      rather than at the next push. Saving does not move anything: if the
+      registry already holds blobs you will be offered a migration.</p>`;
+}
+
+/** Progress and controls for a migration between backends. */
+function storageMigrationHTML(m) {
+  if (!m || (!m.running && !m.started_at)) return '';
+  const pct = m.bytes_total ? Math.round((m.bytes_done / m.bytes_total) * 100) : 0;
+  if (m.running) {
+    return `<div class="card" style="margin-top:1rem;background:var(--bg)">
+      <h3>Migrating storage <span class="badge warn">running</span></h3>
+      <p class="muted small"><code>${esc(m.from)}</code> → <code>${esc(m.to)}</code></p>
+      <dl class="kv">
+        <dt>Progress</dt><dd>${pct}% — ${m.copied + m.skipped} of ${m.total} objects,
+          ${esc(bytes(m.bytes_done))} of ${esc(bytes(m.bytes_total))}</dd>
+        <dt>Copied</dt><dd>${m.copied} (${m.skipped} already present)</dd>
+      </dl>
+      <p class="muted small">Pushes continue to work: writes go to both backends
+        until the copy finishes, so nothing pushed now is lost at the switch.</p>
+    </div>`;
+  }
+  if (m.error) {
+    return `<div class="card" style="margin-top:1rem;background:var(--bg)">
+      <h3>Migration failed <span class="badge danger">error</span></h3>
+      <p class="muted small mono">${esc(m.error)}</p>
+      <p class="muted small">Nothing was switched — the registry is still serving
+        from <code>${esc(m.from)}</code>. Blobs already copied are kept, so
+        retrying resumes rather than starting over.</p>
+      <div class="row" style="margin-top:.8rem">
+        <button class="btn" onclick="migrateStorage(this)">Retry migration</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="card" style="margin-top:1rem;background:var(--bg)">
+    <h3>Migration complete <span class="badge ok">done</span></h3>
+    <p class="muted small">${m.copied} copied, ${m.skipped} already present.
+      Now serving from <code>${esc(m.to)}</code>. The old backend still holds its
+      copy; delete it once you are satisfied.</p>
+  </div>`;
+}
+
+window.toggleStorageForm = () => {
+  const f = $('#storage-form');
+  const b = $('#storage-edit-btn');
+  if (!f) return;
+  f.hidden = !f.hidden;
+  if (b) b.textContent = f.hidden ? 'Change backend' : 'Hide';
+};
+
+window.storageKindChanged = () => {
+  const kind = $('#sb-kind').value;
+  const s3 = $('#sb-s3');
+  if (s3) s3.hidden = kind !== 's3';
+};
+
+window.saveStorage = async (btn) => {
+  const kind = $('#sb-kind').value;
+  const body = { kind };
+  if (kind === 's3') {
+    body.endpoint = $('#sb-endpoint').value.trim();
+    body.bucket = $('#sb-bucket').value.trim();
+    body.region = $('#sb-region').value.trim();
+    body.prefix = $('#sb-prefix').value.trim();
+    body.access_key = $('#sb-access').value.trim();
+    body.secret_key = $('#sb-secret').value;
+    body.path_style = $('#sb-pathstyle').value === 'true';
+    if (!body.bucket) { toast('A bucket is required', 'error'); return; }
+  }
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = 'Testing…';
+  try {
+    const res = await api('/storage', { method: 'PUT', body: JSON.stringify(body) });
+    if (res.active) {
+      toast(`Now storing blobs in ${res.backend}`, 'success');
+      route();
+      return;
+    }
+    // Blobs already exist, so the switch has to carry them across.
+    const go = await modal({
+      title: 'Move existing blobs?',
+      okLabel: 'Start migration',
+      bodyHTML: `<p>Saved <code>${esc(res.backend)}</code> as the target.</p>
+        <p>The registry already holds blobs, and they do not move themselves —
+        until they are copied, the new backend would answer 404 for every image
+        you already have.</p>
+        <p class="muted small">The migration copies every blob and verifies each
+        one against its digest before switching. Pushes keep working throughout:
+        writes go to both backends until it finishes. You can also start it
+        later.</p>`,
+    });
+    if (go) { await migrateStorage(null); } else { route(); }
+  } catch (ex) {
+    toast(ex.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+};
+
+window.migrateStorage = async (btn) => {
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  try {
+    await api('/storage/migrate', { method: 'POST' });
+  } catch (ex) {
+    toast(ex.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry migration'; }
+    return;
+  }
+  toast('Migration started', 'success');
+  route();
+  pollMigration();
+};
+
+/** Refresh the page while a migration runs, so progress is visible without
+ *  the operator reloading to find out whether it finished. */
+async function pollMigration() {
+  const deadline = Date.now() + 3600000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let m;
+    try {
+      m = await api('/storage/migrate');
+    } catch { return; }
+    if (!m.running) {
+      toast(m.error ? 'Migration failed' : 'Migration complete',
+        m.error ? 'error' : 'success');
+      route();
+      return;
+    }
+    // Only redraw the progress block, so the page does not jump under a cursor.
+    if (location.hash.startsWith('#/maintenance')) route();
+  }
+}
+
 async function renderMaintenance(view) {
   const [gcState, settings, stats, maint] = await Promise.all([
     api('/gc'), api('/settings'), api('/stats'), api('/maintenance'),
@@ -1362,35 +1548,30 @@ async function renderMaintenance(view) {
 
     <div class="card">
       <h2>Storage
-        <span class="badge ${st.is_object_store ? 'accent' : ''}">${esc(st.kind || 'filesystem')}</span></h2>
+        <span class="badge ${st.is_object_store ? 'accent' : ''}">${esc(st.kind || 'filesystem')}</span>
+        ${st.env_managed ? '<span class="badge warn">set by environment</span>' : ''}</h2>
       <div class="stat-grid" style="margin:0 0 1rem">
         ${stat('Stored', bytes(stats.disk_bytes), `${stats.disk_blob_count} objects`)}
         ${stat('Referenced', bytes(stats.logical_bytes))}
         ${stat('Unique blobs', stats.blobs)}
       </div>
       <dl class="kv">
-        ${st.is_object_store ? `
-          <dt>Endpoint</dt><dd class="mono">${esc(st.endpoint || '')}</dd>
-          <dt>Bucket</dt><dd class="mono">${esc(st.bucket || '')}</dd>
-          <dt>Region</dt><dd class="mono">${esc(st.region || '')}</dd>
-          ${st.prefix ? `<dt>Key prefix</dt><dd class="mono">${esc(st.prefix)}</dd>` : ''}
-          <dt>Addressing</dt><dd>${st.path_style ? 'path style' : 'virtual host style'}</dd>
-          <dt>Access key</dt><dd class="mono">${esc(st.access_key || '(anonymous)')}</dd>
-          <dt>Upload scratch</dt><dd class="mono">${esc(st.scratch_dir || '')}</dd>
-        ` : `
-          <dt>Blob directory</dt><dd class="mono">${esc(st.backend || '')}</dd>
-          <dt>Upload scratch</dt><dd class="mono">${esc(st.scratch_dir || '')}</dd>
-        `}
+        <dt>Serving from</dt><dd class="mono">${esc(st.backend || '')}</dd>
+        <dt>Upload scratch</dt><dd class="mono">${esc(st.scratch_dir || '')}</dd>
       </dl>
       <div class="row" style="margin-top:.8rem">
         <button class="btn" onclick="checkStorage()">Test connection</button>
+        ${st.editable ? `<button class="btn ghost" onclick="toggleStorageForm()"
+          id="storage-edit-btn">Change backend</button>` : ''}
       </div>
-      <p class="muted small" style="margin-top:.7rem">
-        Storage is chosen at start-up from the environment
-        (<code>REGISTRY_S3_BUCKET</code> and friends) and cannot be switched
-        while the registry is running — blobs already written would be stranded
-        in the old backend. Change the environment and restart.
-      </p>
+      ${st.env_managed ? `<p class="muted small" style="margin-top:.7rem">
+        Storage is set by the environment (<code>REGISTRY_S3_BUCKET</code> and
+        friends), which takes precedence over anything configured here. Unset
+        those variables to manage storage from this page.</p>` : ''}
+      ${storageMigrationHTML(st.migration || {})}
+      <div id="storage-form" hidden style="margin-top:1rem">
+        ${storageFormHTML(st)}
+      </div>
     </div>
 
     <div class="card">

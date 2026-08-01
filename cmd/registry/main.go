@@ -49,7 +49,7 @@ func run() error {
 
 	// Blobs live in an object store when one is configured, and on local disk
 	// otherwise. Upload scratch space stays local either way.
-	st, err := openStore(cfg, log)
+	st, err := openStore(context.Background(), database, cfg, log)
 	if err != nil {
 		return err
 	}
@@ -185,17 +185,45 @@ func writeLimit(cfg *config.Config) int {
 	return cfg.RateLimit
 }
 
-// openStore builds the blob store, choosing an object store when configured.
-func openStore(cfg *config.Config, log *slog.Logger) (*store.Store, error) {
-	s3cfg, ok := store.S3ConfigFromEnv()
-	if !ok {
+// openStore builds the blob store.
+//
+// The environment wins where it is set: a REGISTRY_S3_* value in a unit file is
+// what its author expects to be in force, and a value quietly overridden from a
+// web form is a bad surprise during an incident. Only when the environment is
+// silent does the configuration saved through the UI apply.
+func openStore(ctx context.Context, database *db.DB, cfg *config.Config, log *slog.Logger) (*store.Store, error) {
+	if s3cfg, ok := store.S3ConfigFromEnv(); ok {
+		backend, err := store.NewS3Backend(s3cfg)
+		if err != nil {
+			return nil, fmt.Errorf("configure S3 storage: %w", err)
+		}
+		log.Info("using object storage for blobs", "source", "environment",
+			"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
+			"prefix", s3cfg.Prefix, "path_style", s3cfg.PathStyle)
+		return store.NewWithBackend(cfg.DataDir, cfg.MaxUploadBytes, backend)
+	}
+
+	saved, ok := store.ParsePersisted(database.GetSetting(ctx, api.StorageSettingKey, ""))
+	if !ok || saved.Kind != "s3" {
 		return store.New(cfg.DataDir, cfg.MaxUploadBytes)
+	}
+	key, err := store.ConfigKey(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("read storage config key: %w", err)
+	}
+	s3cfg, err := saved.S3(key)
+	if err != nil {
+		// Refusing to start would strand the registry on an unreadable
+		// credential; falling back to local disk would silently serve 404 for
+		// every blob in the bucket. Neither is good, so say exactly what is
+		// wrong and stop.
+		return nil, fmt.Errorf("stored S3 configuration could not be read: %w", err)
 	}
 	backend, err := store.NewS3Backend(s3cfg)
 	if err != nil {
-		return nil, fmt.Errorf("configure S3 storage: %w", err)
+		return nil, fmt.Errorf("configure saved S3 storage: %w", err)
 	}
-	log.Info("using object storage for blobs",
+	log.Info("using object storage for blobs", "source", "saved configuration",
 		"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
 		"prefix", s3cfg.Prefix, "path_style", s3cfg.PathStyle)
 	return store.NewWithBackend(cfg.DataDir, cfg.MaxUploadBytes, backend)

@@ -65,6 +65,9 @@ func (s *Server) adminRouter() http.Handler {
 
 	mux.Handle("GET /settings", s.requireAdmin(s.handleSettingsGet))
 	mux.Handle("POST /storage/check", s.requireAdmin(s.handleStorageCheck))
+	mux.Handle("PUT /storage", s.requireAdmin(s.handleStorageSave))
+	mux.Handle("POST /storage/migrate", s.requireAdmin(s.handleStorageMigrate))
+	mux.Handle("GET /storage/migrate", s.requireAdmin(s.handleStorageMigrate))
 
 	mux.Handle("GET /webhooks", s.requireAdmin(s.handleWebhookList))
 	mux.Handle("POST /webhooks", s.requireAdmin(s.handleWebhookCreate))
@@ -1043,25 +1046,51 @@ func (s *Server) storageView() map[string]any {
 		"backend":         s.Store.Backend(),
 		"scratch_dir":     s.Store.Root(),
 		"is_object_store": false,
+		"env_managed":     envManaged(),
+		"editable":        !envManaged(),
+		"migration":       s.Store.MigrationState(),
 	}
 	if raw, ok := store.S3ConfigFromEnv(); ok {
 		// Report the effective configuration, not the raw environment: an
 		// unset region is us-east-1 in practice, and showing it blank would
 		// misdescribe what the registry is actually doing.
-		cfg := raw.Normalise()
-		out["is_object_store"] = true
-		out["kind"] = "s3"
-		out["endpoint"] = cfg.Endpoint
-		out["bucket"] = cfg.Bucket
-		out["region"] = cfg.Region
-		out["prefix"] = cfg.Prefix
-		out["path_style"] = cfg.PathStyle
-		// Never the secret; enough to tell which credential is in use.
-		out["access_key"] = maskKey(cfg.AccessKey)
-	} else {
-		out["kind"] = "filesystem"
+		describeS3(out, raw.Normalise())
+		out["source"] = "environment"
+		return out
 	}
+
+	out["source"] = "database"
+	saved, ok := s.savedStorage(context.Background())
+	if !ok {
+		out["kind"] = "filesystem"
+		return out
+	}
+	if saved.Kind != "s3" {
+		out["kind"] = "filesystem"
+		return out
+	}
+	describeS3(out, store.S3Config{
+		Endpoint: saved.Endpoint, Region: saved.Region, Bucket: saved.Bucket,
+		Prefix: saved.Prefix, AccessKey: saved.AccessKey, PathStyle: saved.PathStyle,
+	}.Normalise())
+	// The saved configuration is the target; whether it is live depends on
+	// whether a migration has carried the blobs across yet.
+	out["active"] = strings.HasPrefix(s.Store.Backend(), "s3(")
 	return out
+}
+
+// describeS3 fills in the fields an operator can check against what they typed.
+// The secret is never included; the access key is masked to identify which
+// credential is in use without disclosing it.
+func describeS3(out map[string]any, cfg store.S3Config) {
+	out["is_object_store"] = true
+	out["kind"] = "s3"
+	out["endpoint"] = cfg.Endpoint
+	out["bucket"] = cfg.Bucket
+	out["region"] = cfg.Region
+	out["prefix"] = cfg.Prefix
+	out["path_style"] = cfg.PathStyle
+	out["access_key"] = maskKey(cfg.AccessKey)
 }
 
 // maskKey shows enough of an access key to identify it without disclosing it.
