@@ -313,7 +313,7 @@ func TestUploadRejectsCorruptedContent(t *testing.T) {
 	resp = h.do(http.MethodPut, location+"?digest="+wrongDigest, []byte("what was actually sent"))
 	h.expectStatus(resp, http.StatusBadRequest, "corrupted upload must be rejected")
 
-	if h.store.Exists(wrongDigest) {
+	if h.store.For("test/repo").Exists(wrongDigest) {
 		t.Fatal("a blob was stored under a digest that does not match its content")
 	}
 }
@@ -515,7 +515,7 @@ func TestDeleteTagKeepsManifest(t *testing.T) {
 // pointing at the same content.
 func mustManifestBytes(h *harness, repo, digest string) []byte {
 	h.t.Helper()
-	b, err := h.store.ReadAll(digest)
+	b, err := h.store.For("test/repo").ReadAll(digest)
 	if err != nil {
 		h.t.Fatalf("read manifest: %v", err)
 	}
@@ -656,7 +656,7 @@ func TestGarbageCollectionKeepsSharedLayers(t *testing.T) {
 	h.expectStatus(resp, http.StatusOK, "surviving manifest")
 
 	sharedDigest := store.Digest([]byte(shared))
-	if !h.store.Exists(sharedDigest) {
+	if !h.store.For("test/repo").Exists(sharedDigest) {
 		t.Fatal("garbage collection deleted a layer another repository still references")
 	}
 }

@@ -201,7 +201,7 @@ func (g *Generator) run(ctx context.Context, job Job) {
 // new SBOM was written; an image that is not scannable, or that already has an
 // SBOM, is skipped without error.
 func (g *Generator) Generate(ctx context.Context, job Job) (bool, error) {
-	raw, err := g.Store.ReadAll(job.Digest)
+	raw, err := g.Store.For(job.RepoName).ReadAll(job.Digest)
 	if err != nil {
 		return false, fmt.Errorf("read manifest: %w", err)
 	}
@@ -225,7 +225,7 @@ func (g *Generator) Generate(ctx context.Context, job Job) (bool, error) {
 	for _, l := range m.Layers {
 		src := LayerSource{Digest: l.Digest, MediaType: l.MediaType}
 		src.Open = func() (io.ReadCloser, error) {
-			f, _, err := g.Store.Open(src.Digest)
+			f, _, err := g.Store.For(job.RepoName).Open(src.Digest)
 			return f, err
 		}
 		layers = append(layers, src)
@@ -354,11 +354,11 @@ func (g *Generator) document(job Job, m *imageManifest, scan *Result) *Document 
 // artifact manifest whose subject is the image, so it is discoverable through
 // the referrers API.
 func (g *Generator) publish(ctx context.Context, job Job, m *imageManifest, body []byte, components int) error {
-	sbomDigest, err := g.Store.PutBytes(body)
+	sbomDigest, err := g.Store.For(job.RepoName).PutBytes(body)
 	if err != nil {
 		return fmt.Errorf("store sbom blob: %w", err)
 	}
-	emptyDigest, err := g.Store.PutBytes([]byte("{}"))
+	emptyDigest, err := g.Store.For(job.RepoName).PutBytes([]byte("{}"))
 	if err != nil {
 		return fmt.Errorf("store empty config: %w", err)
 	}
@@ -389,7 +389,7 @@ func (g *Generator) publish(ctx context.Context, job Job, m *imageManifest, body
 		},
 	}
 	// The subject descriptor must carry the subject's own size.
-	if raw, err := g.Store.ReadAll(job.Digest); err == nil {
+	if raw, err := g.Store.For(job.RepoName).ReadAll(job.Digest); err == nil {
 		art.Subject.Size = int64(len(raw))
 	}
 
@@ -397,7 +397,7 @@ func (g *Generator) publish(ctx context.Context, job Job, m *imageManifest, body
 	if err != nil {
 		return fmt.Errorf("encode artifact manifest: %w", err)
 	}
-	artDigest, err := g.Store.PutBytes(artBody)
+	artDigest, err := g.Store.For(job.RepoName).PutBytes(artBody)
 	if err != nil {
 		return fmt.Errorf("store artifact manifest: %w", err)
 	}

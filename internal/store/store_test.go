@@ -67,14 +67,14 @@ func TestUploadRoundTrip(t *testing.T) {
 		}
 	}
 
-	size, err := s.Commit(up.ID, digestOf(content))
+	size, err := s.For("test/repo").Commit(up.ID, digestOf(content))
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if size != int64(len(content)) {
 		t.Fatalf("committed size = %d, want %d", size, len(content))
 	}
-	got, err := s.ReadAll(digestOf(content))
+	got, err := s.For("test/repo").ReadAll(digestOf(content))
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -101,10 +101,10 @@ func TestCommitRejectsDigestMismatch(t *testing.T) {
 	s.Append(up.ID, strings.NewReader("actual content"), 0)
 
 	wrong := digestOf([]byte("different content"))
-	if _, err := s.Commit(up.ID, wrong); err == nil {
+	if _, err := s.For("test/repo").Commit(up.ID, wrong); err == nil {
 		t.Fatal("Commit accepted a mismatched digest")
 	}
-	if s.Exists(wrong) {
+	if s.For("test/repo").Exists(wrong) {
 		t.Fatal("blob was stored despite the digest mismatch")
 	}
 	// A failed commit must discard the session rather than leave it resumable.
@@ -137,7 +137,7 @@ func TestDeduplicatesIdenticalBlobs(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		up, _ := s.NewUpload()
 		s.Append(up.ID, bytes.NewReader(content), 0)
-		if _, err := s.Commit(up.ID, digestOf(content)); err != nil {
+		if _, err := s.For("test/repo").Commit(up.ID, digestOf(content)); err != nil {
 			t.Fatalf("commit %d: %v", i, err)
 		}
 	}
@@ -171,7 +171,7 @@ func TestWalkBlobs(t *testing.T) {
 	s := newTestStore(t, 0)
 	want := map[string]bool{}
 	for _, c := range []string{"one", "two", "three"} {
-		d, err := s.PutBytes([]byte(c))
+		d, err := s.For("test/repo").PutBytes([]byte(c))
 		if err != nil {
 			t.Fatalf("PutBytes: %v", err)
 		}
@@ -213,10 +213,10 @@ func TestUploadCommitWithSHA512(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 	digest := sha512DigestOf(content)
-	if _, err := s.Commit(up.ID, digest); err != nil {
+	if _, err := s.For("test/repo").Commit(up.ID, digest); err != nil {
 		t.Fatalf("Commit with sha512: %v", err)
 	}
-	got, err := s.ReadAll(digest)
+	got, err := s.For("test/repo").ReadAll(digest)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -245,10 +245,10 @@ func TestChunkedUploadCommitsUnderEitherAlgorithm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DigestWith: %v", err)
 			}
-			if _, err := s.Commit(up.ID, want); err != nil {
+			if _, err := s.For("test/repo").Commit(up.ID, want); err != nil {
 				t.Fatalf("Commit under %s: %v", algo, err)
 			}
-			if !s.Exists(want) {
+			if !s.For("test/repo").Exists(want) {
 				t.Fatalf("blob not stored under %s digest", algo)
 			}
 		})
@@ -261,10 +261,10 @@ func TestCommitRejectsSHA512Mismatch(t *testing.T) {
 	s.Append(up.ID, strings.NewReader("actual"), 0)
 
 	wrong := sha512DigestOf([]byte("different"))
-	if _, err := s.Commit(up.ID, wrong); err == nil {
+	if _, err := s.For("test/repo").Commit(up.ID, wrong); err == nil {
 		t.Fatal("Commit accepted a mismatched sha512 digest")
 	}
-	if s.Exists(wrong) {
+	if s.For("test/repo").Exists(wrong) {
 		t.Fatal("blob stored under a sha512 digest that does not match its content")
 	}
 }
@@ -276,14 +276,14 @@ func TestZeroLengthBlob(t *testing.T) {
 		t.Fatalf("Append empty: %v", err)
 	}
 	digest := digestOf(nil)
-	size, err := s.Commit(up.ID, digest)
+	size, err := s.For("test/repo").Commit(up.ID, digest)
 	if err != nil {
 		t.Fatalf("Commit empty blob: %v", err)
 	}
 	if size != 0 {
 		t.Fatalf("size = %d, want 0", size)
 	}
-	if !s.Exists(digest) {
+	if !s.For("test/repo").Exists(digest) {
 		t.Fatal("the empty blob must be storable and addressable")
 	}
 }

@@ -62,6 +62,7 @@ func (m *migration) update(fn func(*MigrationState)) {
 // Migrate, or it would start answering 404 for everything it already had.
 func (s *Store) SetBackend(b Backend) {
 	s.backend.Store(&backendRef{b: b})
+	s.router.SetFallback(b)
 }
 
 // Migrating reports whether a migration is currently running.
@@ -102,6 +103,7 @@ func (s *Store) Migrate(ctx context.Context, target Backend, onDone func(error))
 			// after, never before, so there is no instant where a write could
 			// reach neither backend.
 			s.backend.Store(&backendRef{b: target})
+			s.router.SetFallback(target)
 			s.mirror.Store(&backendRef{})
 		} else {
 			s.mirror.Store(&backendRef{})
@@ -261,6 +263,24 @@ func (s *Store) mirrorTarget() Backend {
 		return r.b
 	}
 	return nil
+}
+
+// putTo writes to a specific backend, mirroring only when that backend is the
+// one being migrated away from. A repository routed elsewhere is untouched by a
+// migration of the default backend.
+func (s *Store) putTo(ctx context.Context, b Backend, key string, r io.Reader, size int64) error {
+	if b.Name() == s.primary().Name() {
+		return s.putBoth(ctx, key, r, size)
+	}
+	return b.Put(ctx, key, r, size)
+}
+
+// deleteFrom removes an object from a specific backend.
+func (s *Store) deleteFrom(ctx context.Context, b Backend, key string) error {
+	if b.Name() == s.primary().Name() {
+		return s.deleteBoth(ctx, key)
+	}
+	return b.Delete(ctx, key)
 }
 
 // putBoth writes to the primary backend and, during a migration, to the target.

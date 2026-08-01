@@ -416,7 +416,7 @@ func (s *Scanner) componentsFor(ctx context.Context, job Job) ([]component, erro
 	if len(sboms) == 0 {
 		return nil, nil
 	}
-	artBody, err := s.Store.ReadAll(sboms[0].Digest)
+	artBody, err := s.Store.For(job.RepoName).ReadAll(sboms[0].Digest)
 	if err != nil {
 		return nil, nil
 	}
@@ -428,7 +428,7 @@ func (s *Scanner) componentsFor(ctx context.Context, job Job) ([]component, erro
 	if err := json.Unmarshal(artBody, &art); err != nil || len(art.Layers) == 0 {
 		return nil, nil
 	}
-	docBody, err := s.Store.ReadAll(art.Layers[0].Digest)
+	docBody, err := s.Store.For(job.RepoName).ReadAll(art.Layers[0].Digest)
 	if err != nil {
 		return nil, nil
 	}

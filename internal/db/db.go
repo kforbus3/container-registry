@@ -316,6 +316,44 @@ CREATE INDEX idx_grants_user ON repo_grants(user_id);
 -- and a fresh fetch produce identical findings.
 ALTER TABLE vuln_advisories ADD COLUMN document TEXT NOT NULL DEFAULT '';
 `},
+
+	{"009_storage_routing", `
+-- Blobs can live in more than one backend, chosen by the repository they
+-- belong to: an export-controlled namespace in a GovCloud bucket, a partner
+-- namespace in a commercial one, everything else on local disk.
+--
+-- The routing key is the repository rather than the user who pushed. Following
+-- the actor would let one repository accumulate layers in several buckets, and
+-- would make the residency boundary track people instead of content.
+CREATE TABLE storage_backends (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	name       TEXT    NOT NULL UNIQUE,   -- operator label: govcloud, commercial
+	config     TEXT    NOT NULL,          -- kind, endpoint, bucket, sealed secret
+	created_at TEXT    NOT NULL,
+	updated_at TEXT    NOT NULL
+);
+
+-- Rules are ordered and the first match wins, so a specific pattern can sit
+-- above a general one. A repository matching no rule uses the default backend.
+CREATE TABLE storage_rules (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	pattern    TEXT    NOT NULL,
+	backend_id INTEGER NOT NULL REFERENCES storage_backends(id) ON DELETE CASCADE,
+	priority   INTEGER NOT NULL DEFAULT 100,
+	created_at TEXT    NOT NULL
+);
+CREATE INDEX idx_storage_rules_priority ON storage_rules(priority);
+
+-- Where a repository's blobs actually are, which is not always where the rules
+-- say they should be: a rule added after content was pushed leaves the blobs
+-- behind until they are migrated. Recording the truth separately is what makes
+-- that difference visible rather than silent.
+CREATE TABLE repository_storage (
+	repo_id    INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+	backend    TEXT    NOT NULL,          -- resolved backend name, or "" for default
+	updated_at TEXT    NOT NULL
+);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

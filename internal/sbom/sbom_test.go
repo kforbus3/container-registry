@@ -348,12 +348,12 @@ func (h *harness) pushImage(t *testing.T) string {
 		"lib/apk/db/installed": alpineDB,
 		"etc/os-release":       "ID=alpine\nVERSION_ID=3.20.3\n",
 	}, nil)
-	layerDigest, err := h.store.PutBytes(layer)
+	layerDigest, err := h.store.For("test/repo").PutBytes(layer)
 	if err != nil {
 		t.Fatalf("store layer: %v", err)
 	}
 	cfg := []byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`)
-	cfgDigest, _ := h.store.PutBytes(cfg)
+	cfgDigest, _ := h.store.For("test/repo").PutBytes(cfg)
 
 	manifest := map[string]any{
 		"schemaVersion": 2,
@@ -368,7 +368,7 @@ func (h *harness) pushImage(t *testing.T) string {
 		}},
 	}
 	body, _ := json.Marshal(manifest)
-	digest, _ := h.store.PutBytes(body)
+	digest, _ := h.store.For("test/repo").PutBytes(body)
 
 	ctx := context.Background()
 	if err := h.db.PutManifest(ctx, &db.Manifest{
@@ -413,7 +413,7 @@ func TestGeneratePublishesReferrer(t *testing.T) {
 	}
 
 	// And the document itself must be well-formed CycloneDX naming the packages.
-	artBody, err := h.store.ReadAll(refs[0].Digest)
+	artBody, err := h.store.For("test/repo").ReadAll(refs[0].Digest)
 	if err != nil {
 		t.Fatalf("read artifact: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestGeneratePublishesReferrer(t *testing.T) {
 	if len(art.Layers) != 1 {
 		t.Fatalf("artifact has %d layers, want 1", len(art.Layers))
 	}
-	docBody, err := h.store.ReadAll(art.Layers[0].Digest)
+	docBody, err := h.store.For("test/repo").ReadAll(art.Layers[0].Digest)
 	if err != nil {
 		t.Fatalf("read document: %v", err)
 	}
