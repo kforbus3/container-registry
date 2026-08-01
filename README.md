@@ -159,6 +159,7 @@ referrer attached by ORAS, discovered back through the referrers API.
 - Repositories can be marked public (readable by anyone) or immutable
   (existing tags cannot be moved to different content)
 - Every push, delete, tag and administrative change is written to an audit log
+- Per-caller rate limiting, with pushes limited separately from reads
 
 **Management**
 
@@ -201,6 +202,9 @@ All configuration is by environment variable.
 | `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused |
 | `REGISTRY_MAINTENANCE_INTERVAL` | `6h` | How often retention and collection run; `0` disables |
 | `REGISTRY_MAINTENANCE_DELAY` | `5m` | Delay before the first scheduled sweep |
+| `REGISTRY_RATE_LIMIT` | `0` | Requests per minute per caller; `0` disables |
+| `REGISTRY_RATE_LIMIT_WRITES` | *(uses `RATE_LIMIT`)* | Separate, usually lower, limit for pushes and deletes |
+| `REGISTRY_RATE_BURST` | *(one second's worth)* | How many requests may arrive at once |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -464,6 +468,34 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Rate limiting
+
+Off by default. Setting `REGISTRY_RATE_LIMIT` bounds how fast one caller can
+drive the registry, which authentication alone does nothing about — a single
+valid token can otherwise saturate upload capacity and fill the disk.
+
+```bash
+REGISTRY_RATE_LIMIT=600          # 10 requests a second, sustained
+REGISTRY_RATE_LIMIT_WRITES=60    # but only one push a second
+REGISTRY_RATE_BURST=50           # tolerate a burst of 50
+```
+
+Writes are limited separately because a push costs far more than a manifest
+read, so a single number for both cannot be right; leaving the write limit
+unset applies the general limit to both.
+
+A caller is identified by its principal — a token or a user — so a limit
+follows the credential wherever it connects from, and an anonymous caller is
+identified by address because that is all there is. Over-limit requests get
+`429` with the OCI `TOOMANYREQUESTS` code and a `Retry-After` in whole seconds,
+never zero.
+
+Buckets are held in memory, so limits are **per process**: two instances behind
+a load balancer each enforce their own. A shared counter would need a shared
+store and turn every request into a network round trip.
 
 ---
 

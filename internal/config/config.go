@@ -58,6 +58,12 @@ type Config struct {
 	MaintenanceInterval time.Duration
 	// MaintenanceDelay staggers the first scheduled sweep after start-up.
 	MaintenanceDelay time.Duration
+	// RateLimit is the sustained per-caller request rate. Zero disables it.
+	RateLimit int
+	// RateBurst is how many requests may arrive at once before throttling.
+	RateBurst int
+	// RateLimitWrites separately bounds pushes, which cost far more than reads.
+	RateLimitWrites int
 }
 
 func Load() (*Config, error) {
@@ -77,6 +83,9 @@ func Load() (*Config, error) {
 		VulnEndpoint:       env("REGISTRY_VULN_ENDPOINT", "https://api.osv.dev"),
 		VulnWorkers:        envInt("REGISTRY_VULN_WORKERS", 2),
 		VulnQueueDepth:     envInt("REGISTRY_VULN_QUEUE", 256),
+		RateLimit:          envInt("REGISTRY_RATE_LIMIT", 0),
+		RateBurst:          envInt("REGISTRY_RATE_BURST", 0),
+		RateLimitWrites:    envInt("REGISTRY_RATE_LIMIT_WRITES", 0),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 

@@ -85,7 +85,11 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
-		next(w, r.WithContext(withPrincipal(r.Context(), p)))
+		r = r.WithContext(withPrincipal(r.Context(), p))
+		if !s.allowRequest(w, r) {
+			return
+		}
+		next(w, r)
 	})
 }
 

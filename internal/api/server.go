@@ -5,17 +5,20 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/kforbus3/container-registry/internal/auth"
 	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
 	"github.com/kforbus3/container-registry/internal/vuln"
@@ -35,6 +38,55 @@ type Server struct {
 	vuln      *vuln.Scanner
 	scheduler *gc.Scheduler
 	retention *gc.Retention
+
+	reads  *ratelimit.Limiter
+	writes *ratelimit.Limiter
+}
+
+// SetRateLimits installs per-caller limits. Writes are limited separately
+// because a push costs far more than a manifest read, so one sensible number
+// for both does not exist.
+func (s *Server) SetRateLimits(reads, writes ratelimit.Limit) {
+	s.reads = ratelimit.New(reads)
+	s.writes = ratelimit.New(writes)
+}
+
+// rateKey identifies the caller a limit applies to. An authenticated principal
+// is limited as itself wherever it connects from; an anonymous caller is
+// limited by address, which is the only thing there is to go on.
+func (s *Server) rateKey(r *http.Request) string {
+	if p := principalFrom(r.Context()); p != nil && !p.IsAnonymous() {
+		if p.TokenID != 0 {
+			return fmt.Sprintf("token:%d", p.TokenID)
+		}
+		return fmt.Sprintf("user:%d", p.UserID)
+	}
+	return "ip:" + remoteIP(r)
+}
+
+// allowRequest applies the limit for this request, writing the response itself
+// when the caller is over it.
+func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request) bool {
+	limiter := s.reads
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		limiter = s.writes
+	}
+	if limiter == nil {
+		return true
+	}
+	ok, retry := limiter.Allow(s.rateKey(r))
+	if ok {
+		return true
+	}
+	seconds := int(retry.Seconds() + 0.999)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	s.ociErr(w, http.StatusTooManyRequests, codeTooManyRequests,
+		"rate limit exceeded; retry after "+strconv.Itoa(seconds)+"s", nil)
+	return false
 }
 
 // urlPathUnescape is a thin alias so admin.go does not import net/url directly.

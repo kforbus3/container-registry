@@ -19,6 +19,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
 	"github.com/kforbus3/container-registry/internal/vuln"
@@ -70,6 +71,15 @@ func run() error {
 
 	srv := api.NewServer(cfg, database, st, log)
 	srv.SetCollector(collector)
+	srv.SetRateLimits(
+		ratelimit.Limit{PerMinute: cfg.RateLimit, Burst: cfg.RateBurst},
+		ratelimit.Limit{PerMinute: writeLimit(cfg), Burst: cfg.RateBurst},
+	)
+	if cfg.RateLimit > 0 || cfg.RateLimitWrites > 0 {
+		log.Info("rate limiting enabled",
+			"reads_per_minute", cfg.RateLimit,
+			"writes_per_minute", writeLimit(cfg), "burst", cfg.RateBurst)
+	}
 
 	httpSrv := &http.Server{
 		Addr:    cfg.Addr,
@@ -167,6 +177,15 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// writeLimit falls back to the general limit when no separate write limit is
+// configured, so setting one number still protects the expensive path.
+func writeLimit(cfg *config.Config) int {
+	if cfg.RateLimitWrites > 0 {
+		return cfg.RateLimitWrites
+	}
+	return cfg.RateLimit
 }
 
 func logLevel() slog.Level {

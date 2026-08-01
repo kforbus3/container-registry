@@ -172,7 +172,13 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 		return
 	}
 
-	next(w, r.WithContext(withPrincipal(r.Context(), p)))
+	r = r.WithContext(withPrincipal(r.Context(), p))
+	// Applied after authentication so an authenticated caller is limited as
+	// itself rather than sharing a bucket with everyone behind the same address.
+	if !s.allowRequest(w, r) {
+		return
+	}
+	next(w, r)
 }
 
 func actionName(a action) string {
@@ -207,6 +213,12 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 		s.challenge(w, "authentication required")
 		return
 	}
+	// This endpoint resolves its own principal rather than going through the
+	// guard, so the limit has to be applied here as well.
+	r = r.WithContext(withPrincipal(r.Context(), p))
+	if !s.allowRequest(w, r) {
+		return
+	}
 	if p != nil && !p.IsAnonymous() {
 		s.DB.Audit(r.Context(), p.Display(), "login", "", "", "api version check", remoteIP(r))
 	}
@@ -223,6 +235,10 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == nil {
 		p = auth.Anonymous()
+	}
+	r = r.WithContext(withPrincipal(r.Context(), p))
+	if !s.allowRequest(w, r) {
+		return
 	}
 	n, last := paginationParams(r)
 	if n == 0 {

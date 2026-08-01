@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/store"
 )
 
@@ -1270,4 +1272,91 @@ func attachSBOM(h *harness, repo, subject string) {
 	resp := h.do(http.MethodPut, "/v2/"+repo+"/manifests/"+store.Digest(artifact),
 		artifact, contentType(MediaTypeOCIManifest))
 	h.expectStatus(resp, http.StatusCreated, "attach SBOM referrer")
+}
+
+// ------------------------------------------------- rate limiting
+
+// A valid token must not be able to saturate the registry. The OCI error code
+// for this was declared from the start but went unused until now.
+func TestRateLimitReturnsOCIErrorAndRetryAfter(t *testing.T) {
+	h := newHarness(t)
+	// One request per minute with no burst headroom.
+	h.server.SetRateLimits(
+		ratelimit.Limit{PerMinute: 60, Burst: 1},
+		ratelimit.Limit{PerMinute: 60, Burst: 1},
+	)
+
+	resp := h.do(http.MethodGet, "/v2/", nil)
+	h.expectStatus(resp, http.StatusOK, "first request")
+
+	resp = h.do(http.MethodGet, "/v2/", nil)
+	body := h.expectStatus(resp, http.StatusTooManyRequests, "second request")
+	if !bytes.Contains(body, []byte(codeTooManyRequests)) {
+		t.Fatalf("error body should carry %s: %s", codeTooManyRequests, body)
+	}
+	// A client cannot back off sensibly without being told how long.
+	retry := resp.Header.Get("Retry-After")
+	if retry == "" {
+		t.Fatal("a throttled response must carry Retry-After")
+	}
+	if n, err := strconv.Atoi(retry); err != nil || n < 1 {
+		t.Fatalf("Retry-After = %q, want whole seconds of at least 1", retry)
+	}
+}
+
+// Limits follow the principal, so one token cannot spend another's allowance.
+func TestRateLimitIsPerPrincipal(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.server.SetRateLimits(
+		ratelimit.Limit{PerMinute: 60, Burst: 1},
+		ratelimit.Limit{PerMinute: 60, Burst: 1},
+	)
+
+	hash, _ := auth.HashPassword("userpassword")
+	u, _ := h.db.CreateUser(ctx, "dev", hash, "user")
+	plaintext, prefix, secretHash, _ := auth.GenerateToken()
+	h.db.CreateToken(ctx, &db.Token{
+		Name: "t", UserID: u.ID, Prefix: prefix, SecretHash: secretHash,
+		CanPull: true, RepoPattern: "*",
+	})
+	withToken := func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+plaintext) }
+
+	// Spend the admin's allowance.
+	h.do(http.MethodGet, "/v2/", nil).Body.Close()
+	resp := h.do(http.MethodGet, "/v2/", nil)
+	h.expectStatus(resp, http.StatusTooManyRequests, "admin is throttled")
+
+	// The token has its own bucket and is unaffected.
+	resp = h.do(http.MethodGet, "/v2/", nil, withToken)
+	h.expectStatus(resp, http.StatusOK, "a separate principal keeps its own allowance")
+}
+
+// Reads and writes are limited separately, because a push costs far more than
+// a manifest read and one number for both cannot be right.
+func TestReadAndWriteLimitsAreSeparate(t *testing.T) {
+	h := newHarness(t)
+	h.server.SetRateLimits(
+		ratelimit.Limit{PerMinute: 6000, Burst: 100}, // reads: generous
+		ratelimit.Limit{PerMinute: 60, Burst: 1},     // writes: tight
+	)
+	// Reads stay available.
+	for i := 0; i < 5; i++ {
+		resp := h.do(http.MethodGet, "/v2/", nil)
+		h.expectStatus(resp, http.StatusOK, "read")
+	}
+	// The first write is allowed, the second throttled.
+	resp := h.do(http.MethodPost, "/v2/team-a/app/blobs/uploads/", nil)
+	h.expectStatus(resp, http.StatusAccepted, "first write")
+	resp = h.do(http.MethodPost, "/v2/team-a/app/blobs/uploads/", nil)
+	h.expectStatus(resp, http.StatusTooManyRequests, "second write")
+}
+
+// With no limit configured the registry behaves exactly as before.
+func TestNoRateLimitByDefault(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < 50; i++ {
+		resp := h.do(http.MethodGet, "/v2/", nil)
+		h.expectStatus(resp, http.StatusOK, "unlimited request")
+	}
 }
