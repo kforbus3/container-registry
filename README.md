@@ -60,6 +60,17 @@ certs/
   tls.key    readable by uid 10001, the user the registry runs as
 ```
 
+For testing, generate one:
+
+```bash
+make certs                                  # registry.local + localhost
+make certs HOSTS="registry.example.com"     # or name your own
+```
+
+That creates a small local authority in `certs/ca.crt` and a server certificate
+signed by it, and prints how to make Docker, podman and curl trust the
+authority. See [Development certificates](#development-certificates) below.
+
 The registry listens on 5000 inside the container and is published on 443 on the
 host, so it never needs `CAP_NET_BIND_SERVICE`. To serve on a different host
 port, set `REGISTRY_PORT`; to have the process itself bind 443 (with host
@@ -335,6 +346,57 @@ total bytes, entry count, manifest count, binary count) so a hostile image
 cannot exhaust the server. Indexes are not scanned directly — each platform
 manifest they point at is described on its own. Set `REGISTRY_SBOM=false` to
 turn the whole thing off.
+
+---
+
+## Development certificates
+
+`make certs` (or `./scripts/dev-certs.sh [hostname ...]`) issues a certificate
+for local testing:
+
+```
+certs/ca.crt    the authority — this is what clients trust
+certs/ca.key    its key; keep it to issue more certificates later
+certs/tls.crt   the server certificate the registry serves
+certs/tls.key   its key
+```
+
+It creates a small authority and signs a leaf with it, rather than emitting one
+bare self-signed certificate. That is deliberate: a client trusts the CA **once**
+and keeps working when the server certificate is reissued, renewed, or extended
+to another hostname. Re-running the script reuses an existing authority, so
+adding a hostname does not invalidate trust you have already set up.
+
+Every name you intend to use must be on the certificate. Modern clients ignore
+the common name entirely and match only the subject alternative names, so
+`./scripts/dev-certs.sh registry.local` will not work for `myhost.lan`.
+
+Generating the certificate is the easy half; making clients trust it is where
+this usually goes wrong. The script prints the exact commands, which differ by
+tool:
+
+| Tool | Where the CA goes |
+| --- | --- |
+| curl, scripts | `--cacert certs/ca.crt`, or `SSL_CERT_FILE=$PWD/certs/ca.crt` |
+| Docker Engine (Linux) | `/etc/docker/certs.d/<host>[:<port>]/ca.crt` |
+| Docker Desktop (macOS) | the system keychain, then restart Docker |
+| podman, skopeo, buildah | `/etc/containers/certs.d/<host>/ca.crt` |
+
+If the hostname is not real, point it at yourself:
+`echo "127.0.0.1 registry.local" | sudo tee -a /etc/hosts`.
+
+Prefer not to manage trust by hand? [mkcert](https://github.com/FiloSottile/mkcert)
+installs its authority into the system store for you:
+
+```bash
+brew install mkcert && mkcert -install
+mkcert -cert-file certs/tls.crt -key-file certs/tls.key registry.local localhost 127.0.0.1
+```
+
+Certificates are development-only either way, and `certs/` is gitignored so a
+private key cannot be committed. Anything other people reach wants a
+certificate from a real authority — [Let's Encrypt](https://letsencrypt.org) is
+free.
 
 ---
 

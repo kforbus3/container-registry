@@ -46,6 +46,10 @@ fmt: ## Format all Go source
 .PHONY: check
 check: fmt vet test ## Format, vet and test
 
+.PHONY: certs
+certs: ## Generate a development TLS certificate into ./certs
+	@./scripts/dev-certs.sh $(HOSTS)
+
 .PHONY: conformance
 conformance: build ## Run the official OCI distribution-spec conformance suite
 	@./scripts/conformance.sh

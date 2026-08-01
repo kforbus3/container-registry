@@ -279,6 +279,87 @@ No layers move; only the tag is written. `docker pull` sees it immediately.
 
 ---
 
+## Moving to HTTPS
+
+Everything above used `localhost`, which Docker lets you talk to over plain
+HTTP. The moment you use any other name — a hostname on your LAN, a server —
+Docker demands HTTPS. Here is the shortest path to that working.
+
+**1. Issue a certificate.** Name every host you will type into a `docker push`:
+
+```bash
+make certs HOSTS="registry.local"
+```
+
+This writes `certs/ca.crt` (the authority), `certs/tls.crt` and `certs/tls.key`.
+
+**2. Make the name resolve**, if it is not already a real DNS name:
+
+```bash
+echo "127.0.0.1 registry.local" | sudo tee -a /etc/hosts
+```
+
+**3. Start the registry**, this time with the plain compose file — it serves
+HTTPS on 443 and picks up `./certs` automatically:
+
+```bash
+REGISTRY_ADMIN_PASSWORD=choose-a-password docker compose up -d --build
+```
+
+Check it before involving Docker, trusting the authority explicitly:
+
+```bash
+curl --cacert certs/ca.crt https://registry.local/healthz
+```
+
+```json
+{"status":"ok"}
+```
+
+**4. Teach Docker to trust the authority.** This is the step people skip, and
+the reason for `x509: certificate signed by unknown authority`.
+
+On Docker Desktop for macOS:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain certs/ca.crt
+```
+
+Then restart Docker Desktop — it only reads the keychain at startup.
+
+On Docker Engine on Linux, no restart needed:
+
+```bash
+sudo mkdir -p /etc/docker/certs.d/registry.local
+sudo cp certs/ca.crt /etc/docker/certs.d/registry.local/ca.crt
+```
+
+**5. Push as usual**, with no port in the name — 443 is implied:
+
+```bash
+docker login registry.local -u admin
+docker tag hello-app:1.0 registry.local/demo/hello-app:1.0
+docker push registry.local/demo/hello-app:1.0
+```
+
+To check the TLS side without changing any system trust, use a tool that takes
+the CA as an argument:
+
+```bash
+docker run --rm --add-host=registry.local:host-gateway \
+  -v "$PWD/certs/ca.crt":/etc/containers/certs.d/registry.local/ca.crt:ro \
+  quay.io/skopeo/stable:latest \
+  copy --dest-creds admin:choose-a-password \
+  docker://alpine:3.20 docker://registry.local/demo/alpine:3.20
+```
+
+These certificates are for development. For anything other people reach, get a
+real one — [Let's Encrypt](https://letsencrypt.org) is free — and skip the
+trust step entirely, because the whole world already trusts it.
+
+---
+
 ## Troubleshooting
 
 **`connection refused` on port 5000, or you get a strange 403.**
