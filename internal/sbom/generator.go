@@ -68,6 +68,11 @@ type Generator struct {
 	Log    *slog.Logger
 	Limits Limits
 
+	// OnPublished, when set, is called after an SBOM is written. It is how
+	// vulnerability scanning is chained on without this package having to know
+	// anything about it.
+	OnPublished func(job Job)
+
 	queue chan Job
 	wg    sync.WaitGroup
 
@@ -246,6 +251,9 @@ func (g *Generator) Generate(ctx context.Context, job Job) (bool, error) {
 	g.Log.Info("sbom published",
 		"repo", job.RepoName, "digest", job.Digest,
 		"components", len(doc.Components), "distro", scan.Distro)
+	if g.OnPublished != nil {
+		g.OnPublished(job)
+	}
 	return true, nil
 }
 

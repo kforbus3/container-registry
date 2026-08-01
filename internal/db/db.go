@@ -162,6 +162,61 @@ CREATE TABLE settings (
 	value TEXT NOT NULL
 );
 `},
+
+	{"002_vulnerabilities", `
+-- One row per image manifest that has been checked against an advisory
+-- database. Counts are denormalised so a repository listing does not have to
+-- aggregate findings on every page load.
+CREATE TABLE vuln_scans (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_id         INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+	manifest_digest TEXT    NOT NULL,
+	source          TEXT    NOT NULL,
+	status          TEXT    NOT NULL,            -- ok | error
+	error           TEXT    NOT NULL DEFAULT '',
+	components      INTEGER NOT NULL DEFAULT 0,
+	critical        INTEGER NOT NULL DEFAULT 0,
+	high            INTEGER NOT NULL DEFAULT 0,
+	medium          INTEGER NOT NULL DEFAULT 0,
+	low             INTEGER NOT NULL DEFAULT 0,
+	unknown         INTEGER NOT NULL DEFAULT 0,
+	fixable         INTEGER NOT NULL DEFAULT 0,
+	-- Components that no advisory database indexes, so the result can say
+	-- "not checked" instead of implying they were checked and found clean.
+	unqueryable     INTEGER NOT NULL DEFAULT 0,
+	scanned_at      TEXT    NOT NULL,
+	UNIQUE(repo_id, manifest_digest)
+);
+CREATE INDEX idx_vuln_scans_digest ON vuln_scans(manifest_digest);
+
+CREATE TABLE vuln_findings (
+	scan_id       INTEGER NOT NULL REFERENCES vuln_scans(id) ON DELETE CASCADE,
+	vuln_id       TEXT    NOT NULL,
+	purl          TEXT    NOT NULL,
+	package       TEXT    NOT NULL,
+	version       TEXT    NOT NULL DEFAULT '',
+	ecosystem     TEXT    NOT NULL DEFAULT '',
+	severity      TEXT    NOT NULL DEFAULT 'UNKNOWN',
+	cvss          REAL    NOT NULL DEFAULT 0,
+	summary       TEXT    NOT NULL DEFAULT '',
+	aliases       TEXT    NOT NULL DEFAULT '',
+	fixed_version TEXT    NOT NULL DEFAULT '',
+	PRIMARY KEY(scan_id, vuln_id, purl)
+);
+CREATE INDEX idx_vuln_findings_severity ON vuln_findings(scan_id, severity);
+
+-- Advisory details are shared across every image that contains the affected
+-- package, so they are fetched once and reused.
+CREATE TABLE vuln_advisories (
+	id         TEXT PRIMARY KEY,
+	aliases    TEXT NOT NULL DEFAULT '',
+	summary    TEXT NOT NULL DEFAULT '',
+	severity   TEXT NOT NULL DEFAULT 'UNKNOWN',
+	cvss       REAL NOT NULL DEFAULT 0,
+	modified   TEXT NOT NULL DEFAULT '',
+	fetched_at TEXT NOT NULL
+);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

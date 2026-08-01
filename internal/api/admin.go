@@ -15,6 +15,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/gc"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
+	"github.com/kforbus3/container-registry/internal/vuln"
 )
 
 // GC is set by main so the admin API can trigger collection.
@@ -23,6 +24,9 @@ func (s *Server) SetCollector(c *gc.Collector) { s.collector = c }
 // SetSBOMGenerator wires in automatic SBOM generation. A nil generator simply
 // disables the feature.
 func (s *Server) SetSBOMGenerator(g *sbom.Generator) { s.sbom = g }
+
+// SetVulnScanner wires in vulnerability scanning. A nil scanner disables it.
+func (s *Server) SetVulnScanner(v *vuln.Scanner) { s.vuln = v }
 
 // adminRouter serves the management API mounted at /api.
 func (s *Server) adminRouter() http.Handler {
@@ -234,6 +238,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"tls":              s.Cfg.TLSEnabled(),
 		"max_upload_bytes": s.Cfg.MaxUploadBytes,
 		"sbom":             s.sbomStats(),
+		"vuln":             s.vulnStatsView(r),
 	})
 }
 
@@ -251,6 +256,30 @@ func (s *Server) sbomStats() any {
 		"failed":    st.Failed,
 		"dropped":   st.Dropped,
 	}
+}
+
+// vulnStatsView reports scanner activity and registry-wide finding counts.
+func (s *Server) vulnStatsView(r *http.Request) any {
+	if s.vuln == nil {
+		return nil
+	}
+	st := s.vuln.Stats()
+	out := map[string]any{
+		"enabled": true,
+		"scanned": st.Scanned,
+		"failed":  st.Failed,
+		"dropped": st.Dropped,
+		"queued":  st.Queued,
+	}
+	if agg, err := s.DB.VulnStats(r.Context()); err == nil {
+		out["images_scanned"] = agg.Scanned
+		out["critical"] = agg.Critical
+		out["high"] = agg.High
+		out["medium"] = agg.Medium
+		out["low"] = agg.Low
+		out["scan_errors"] = agg.Failed
+	}
+	return out
 }
 
 func (s *Server) handleAuditList(w http.ResponseWriter, r *http.Request) {
@@ -709,6 +738,10 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 		s.repoTag(w, r, repo, tail[1])
 	case len(tail) == 3 && tail[0] == "manifests" && tail[2] == "sbom":
 		s.repoSBOM(w, r, repo, tail[1])
+	case len(tail) == 3 && tail[0] == "manifests" && tail[2] == "vulnerabilities":
+		s.repoVulnerabilities(w, r, repo, tail[1])
+	case len(tail) == 3 && tail[0] == "manifests" && tail[2] == "rescan":
+		s.repoRescan(w, r, repo, tail[1])
 	case len(tail) == 2 && tail[0] == "manifests":
 		s.repoManifest(w, r, repo, tail[1])
 	default:
@@ -743,6 +776,28 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 			writeErr(w, http.StatusInternalServerError, "failed to list manifests")
 			return
 		}
+		// Severity counts per tag, so the repository page shows risk without a
+		// request per tag. A tag pointing at an index resolves to the scans of
+		// the platform manifests beneath it.
+		scans, _ := s.DB.VulnScansForRepo(r.Context(), repo.ID)
+		vulnByTag := map[string]any{}
+		if len(scans) > 0 {
+			for _, t := range tags {
+				if sc, ok := scans[t.Digest]; ok {
+					vulnByTag[t.Name] = sc
+					continue
+				}
+				if found, err := s.findSBOMs(r.Context(), repo, t.Digest); err == nil {
+					for _, c := range found {
+						if sc, ok := scans[c.SubjectDigest]; ok {
+							vulnByTag[t.Name] = sc
+							break
+						}
+					}
+				}
+			}
+		}
+
 		tagged := map[string]bool{}
 		for _, t := range tags {
 			tagged[t.Digest] = true
@@ -1015,7 +1070,101 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 		}
 		resp["sbom"] = summary
 	}
+	// Vulnerability counts follow the same index resolution as the SBOM, so a
+	// tag pointing at an index still shows what was found underneath it.
+	if found, err := s.findSBOMs(r.Context(), repo, digest); err == nil && len(found) > 0 {
+		if scan, err := s.DB.GetVulnScan(r.Context(), repo.ID, found[0].SubjectDigest); err == nil {
+			resp["vulnerabilities"] = scan
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// repoVulnerabilities returns the findings for an image, worst first.
+func (s *Server) repoVulnerabilities(w http.ResponseWriter, r *http.Request, repo *db.Repository, digest string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !store.ValidDigest(digest) {
+		writeErr(w, http.StatusBadRequest, "invalid digest")
+		return
+	}
+	target, err := s.vulnTarget(r.Context(), repo, digest, r.URL.Query().Get("platform"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scan, err := s.DB.GetVulnScan(r.Context(), repo.ID, target)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "this image has not been scanned yet")
+		return
+	}
+	findings, err := s.DB.VulnFindings(r.Context(), scan.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to load findings")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"scan":     scan,
+		"findings": findings,
+	})
+}
+
+// repoRescan re-checks an image against the advisory database on demand, which
+// is what you want after a new advisory lands for something already pushed.
+func (s *Server) repoRescan(w http.ResponseWriter, r *http.Request, repo *db.Repository, digest string) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.vuln == nil {
+		writeErr(w, http.StatusServiceUnavailable, "vulnerability scanning is disabled")
+		return
+	}
+	p := principalFrom(r.Context())
+	if !p.CanPushRepo(repo.Name) {
+		writeErr(w, http.StatusForbidden, "push permission is required to trigger a re-scan")
+		return
+	}
+	target, err := s.vulnTarget(r.Context(), repo, digest, r.URL.Query().Get("platform"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.vuln.Enqueue(vuln.Job{RepoID: repo.ID, RepoName: repo.Name, Digest: target})
+	s.audit(r, "vuln.rescan", repo.Name, target, "")
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "queued", "manifest": target,
+	})
+}
+
+// vulnTarget resolves the manifest a scan applies to, following an index to the
+// platform manifest beneath it the same way the SBOM endpoint does.
+func (s *Server) vulnTarget(ctx context.Context, repo *db.Repository, digest, platform string) (string, error) {
+	found, err := s.findSBOMs(ctx, repo, digest)
+	if err != nil || len(found) == 0 {
+		// No SBOM to resolve through: the digest is its own target.
+		return digest, nil
+	}
+	if platform != "" {
+		for _, c := range found {
+			if c.Platform == platform {
+				return c.SubjectDigest, nil
+			}
+		}
+		return "", fmt.Errorf("no scan for platform %q on this manifest", platform)
+	}
+	if len(found) > 1 {
+		platforms := make([]string, 0, len(found))
+		for _, c := range found {
+			platforms = append(platforms, c.Platform)
+		}
+		return "", fmt.Errorf(
+			"this is a multi-platform index with %d scanned images; add ?platform= to choose one of: %s",
+			len(found), strings.Join(platforms, ", "))
+	}
+	return found[0].SubjectDigest, nil
 }
 
 // sbomRef locates one generated SBOM: the artifact holding it, the manifest it

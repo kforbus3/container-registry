@@ -18,6 +18,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/gc"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
+	"github.com/kforbus3/container-registry/internal/vuln"
 )
 
 // Server wires together storage, metadata and authentication behind the HTTP
@@ -31,6 +32,7 @@ type Server struct {
 
 	collector *gc.Collector
 	sbom      *sbom.Generator
+	vuln      *vuln.Scanner
 }
 
 // urlPathUnescape is a thin alias so admin.go does not import net/url directly.

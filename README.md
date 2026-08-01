@@ -140,6 +140,16 @@ referrer attached by ORAS, discovered back through the referrers API.
   distroless images that have no package database at all
 - Runs on background workers; a push is never delayed or failed by it
 
+**Vulnerability scanning**
+
+- Each SBOM is matched against [OSV.dev](https://osv.dev) — free, no credentials,
+  and covering every ecosystem the SBOM scanner detects
+- Severity from the CVSS v3 vector computed in-registry rather than taken from a
+  vendor label, because the same CVE is rated differently by different databases
+- Fixed-version reported per finding, which is the part anyone can act on
+- Per-tag risk in the repository listing, findings and re-scan on the image page
+- Advisories are cached and shared across images, with a freshness bound
+
 **Access control**
 
 - Users with `admin`/`user` roles; the last administrator cannot be removed
@@ -180,6 +190,12 @@ All configuration is by environment variable.
 | `REGISTRY_SBOM` | `true` | Generate an SBOM for each pushed image |
 | `REGISTRY_SBOM_WORKERS` | `2` | Concurrent image scans |
 | `REGISTRY_SBOM_QUEUE` | `256` | Backlog depth before jobs are dropped |
+| `REGISTRY_VULN_SCAN` | `true` | Match each SBOM against an advisory database |
+| `REGISTRY_VULN_ENDPOINT` | `https://api.osv.dev` | OSV-compatible API; point at a mirror to avoid egress |
+| `REGISTRY_VULN_WORKERS` | `2` | Concurrent scans |
+| `REGISTRY_VULN_QUEUE` | `256` | Backlog depth before scans are dropped |
+| `REGISTRY_VULN_TIMEOUT` | `60s` | Per-request timeout to the advisory service |
+| `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -255,6 +271,8 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` | `/api/repositories/<name>/manifests/<digest>` | Manifest, layers, image config, history |
 | `DELETE` | `/api/repositories/<name>/manifests/<digest>` | Delete a manifest and its tags |
 | `GET` | `/api/repositories/<name>/manifests/<digest>/sbom` | Download the generated CycloneDX SBOM (`?platform=os/arch` for a multi-platform index) |
+| `GET` | `/api/repositories/<name>/manifests/<digest>/vulnerabilities` | Findings for an image, worst first |
+| `POST` | `/api/repositories/<name>/manifests/<digest>/rescan` | Re-check against current advisories |
 | `GET` `POST` | `/api/tokens` | List / create tokens |
 | `POST` | `/api/tokens/<id>/revoke` | Revoke a token |
 | `DELETE` | `/api/tokens/<id>` | Delete a token record |
@@ -397,6 +415,45 @@ Certificates are development-only either way, and `certs/` is gitignored so a
 private key cannot be committed. Anything other people reach wants a
 certificate from a real authority — [Let's Encrypt](https://letsencrypt.org) is
 free.
+
+---
+
+## Vulnerability scanning
+
+Publishing an SBOM schedules a scan. Package URLs are matched against
+[OSV.dev](https://osv.dev), and the result is stored per image manifest:
+
+```bash
+curl -u admin:PASSWORD \
+  http://localhost:5001/api/repositories/team-a/app/manifests/<digest>/vulnerabilities
+```
+
+Severity is computed from the advisory's CVSS v3 vector rather than taken from a
+vendor's own label, because the same CVE is routinely rated differently by
+different databases and only the vector is common to all of them. Where no
+usable vector exists the database's qualitative rating is used, and where
+neither exists the finding is reported as `UNKNOWN` rather than assumed benign.
+
+**Accuracy.** Two things had to be handled to avoid reporting nonsense:
+
+- OSV indexes operating-system packages by ecosystem name and language packages
+  by package URL. A purl query for an Alpine or Debian package returns *nothing*
+  — not an error — so getting this wrong reads as "no vulnerabilities". Each
+  component is sent in whichever shape actually finds it.
+- Red Hat's advisories are published under an ecosystem that is not split by
+  release, so a query matches every RHEL major version at once. Left alone, a
+  current UBI 8 image reported 463 high-severity findings, none with a fix.
+  Red Hat findings are now verified against the advisory's own affected ranges
+  using RPM version comparison — including the epoch, which lives in a purl
+  qualifier and outranks everything else. The same image now reports 11.
+
+**What it does not do.** It reports on what the SBOM found, so its coverage is
+the SBOM's coverage. Distribution-backported fixes are a known source of
+over-reporting for language packages bundled by a distribution: RHEL ships
+`urllib3 1.24.2` with fixes backported, but the upstream PyPI feed only knows
+the version number. Findings are advisory matches, not exploitability
+judgements. A failed scan is recorded as failed and shown as such, because
+"could not check" must never render as "clean".
 
 ---
 

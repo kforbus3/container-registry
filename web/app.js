@@ -304,6 +304,11 @@ async function renderOverview(view) {
       ${stat('Unique blobs', stats.blobs)}
       ${stat('Storage on disk', bytes(stats.disk_bytes), `${stats.disk_blob_count} objects`)}
       ${stat('Active tokens', stats.active_tokens)}
+      ${stats.vuln && stats.vuln.enabled
+        ? stat('Vulnerabilities',
+            `${stats.vuln.critical || 0}C / ${stats.vuln.high || 0}H`,
+            `${stats.vuln.images_scanned || 0} images scanned`)
+        : ''}
     </div>
 
     <div class="card">
@@ -384,8 +389,11 @@ async function renderRepo(view, [name]) {
   const canWrite = state.me.admin || state.me.can_push;
   const canDelete = state.me.admin || state.me.can_delete;
 
+  const vulns = data.vulnerabilities || {};
+  const anyScanned = Object.keys(vulns).length > 0;
   const tagRows = tags.map((t) => `<tr>
     <td><strong>${esc(t.name)}</strong></td>
+    ${anyScanned ? `<td>${sevSummary(vulns[t.name]) || '<span class="muted small">—</span>'}</td>` : ''}
     <td><span class="digest" onclick="copy('${jsq(t.digest)}')"
         title="${esc(t.digest)} — click to copy">${esc(shortDigest(t.digest))}</span></td>
     <td class="num">${esc(bytes(t.size))}</td>
@@ -426,7 +434,7 @@ async function renderRepo(view, [name]) {
     <div class="card">
       <h2>Tags</h2>
       ${tableOrEmpty(tagRows,
-        '<tr><th>Tag</th><th>Digest</th><th class="num">Size</th><th>Updated</th><th></th></tr>',
+        `<tr><th>Tag</th>${anyScanned ? '<th>Risk</th>' : ''}<th>Digest</th><th class="num">Size</th><th>Updated</th><th></th></tr>`,
         'No tags in this repository.')}
     </div>
 
@@ -617,11 +625,94 @@ async function renderManifest(view, [repo, digest]) {
 
     ${sbomCard(repo, digest, data.sbom)}
 
+    ${vulnCard(repo, digest, data.vulnerabilities)}
+
     <div class="card">
       <h2>Raw manifest</h2>
       <pre>${esc(JSON.stringify(data.content, null, 2))}</pre>
     </div>`;
 }
+
+/** Compact severity summary, e.g. "2C 14H 30M". Empty when nothing was found. */
+function sevSummary(v) {
+  if (!v) return '';
+  if (v.status && v.status !== 'ok') return '<span class="badge warn">scan failed</span>';
+  const parts = [];
+  if (v.critical) parts.push(`<span class="badge danger">${v.critical}C</span>`);
+  if (v.high) parts.push(`<span class="badge danger">${v.high}H</span>`);
+  if (v.medium) parts.push(`<span class="badge warn">${v.medium}M</span>`);
+  if (v.low) parts.push(`<span class="badge">${v.low}L</span>`);
+  if (!parts.length) return '<span class="badge ok">clean</span>';
+  return parts.join(' ');
+}
+
+/** Render the vulnerability panel for a manifest. */
+function vulnCard(repo, digest, v) {
+  if (!v) {
+    return `<div class="card">
+      <h2>Vulnerabilities</h2>
+      <p class="muted small">Not scanned yet. Images are checked against an advisory
+      database shortly after their bill of materials is generated.</p>
+      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Scan now</button>
+    </div>`;
+  }
+  if (v.status !== 'ok') {
+    return `<div class="card">
+      <h2>Vulnerabilities <span class="badge warn">scan failed</span></h2>
+      <p class="muted small">${esc(v.error || 'The advisory database could not be reached.')}</p>
+      <p class="muted small">This does <strong>not</strong> mean the image is clean —
+      it means it could not be checked.</p>
+      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Retry scan</button>
+    </div>`;
+  }
+  const total = v.critical + v.high + v.medium + v.low + v.unknown;
+  return `<div class="card">
+    <h2>Vulnerabilities ${sevSummary(v)}</h2>
+    <dl class="kv">
+      <dt>Findings</dt><dd>${total} across ${v.components} components</dd>
+      <dt>Fixable</dt><dd>${v.fixable} ${v.fixable ? 'have a fixed version available' : ''}</dd>
+      ${v.unqueryable ? `<dt>Not checked</dt><dd>${v.unqueryable} components no advisory database indexes</dd>` : ''}
+      <dt>Scanned</dt><dd>${esc(fullDate(v.scanned_at))} against <code>${esc(v.source)}</code></dd>
+    </dl>
+    <div class="row" style="margin-top:.8rem">
+      ${total ? `<button class="btn primary" onclick="viewVulns('${jsq(repo)}','${jsq(digest)}')">View findings</button>` : ''}
+      <button class="btn ghost" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Re-scan</button>
+    </div>
+  </div>`;
+}
+
+window.viewVulns = async (repo, digest) => {
+  try {
+    const d = await api(`/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}/vulnerabilities`);
+    const rows = (d.findings || []).map((f) => `<tr>
+      <td><span class="badge ${f.severity === 'CRITICAL' || f.severity === 'HIGH' ? 'danger'
+          : f.severity === 'MEDIUM' ? 'warn' : ''}">${esc(f.severity)}</span>
+        ${f.cvss ? `<div class="muted small">${f.cvss}</div>` : ''}</td>
+      <td>${esc(f.package)}<div class="muted small mono">${esc(f.version || '')}</div></td>
+      <td class="small">${esc(f.vuln_id)}
+        ${f.aliases && f.aliases.length ? `<div class="muted small">${esc(f.aliases.slice(0, 2).join(', '))}</div>` : ''}
+        ${f.summary ? `<div class="muted small">${esc(f.summary.slice(0, 90))}</div>` : ''}</td>
+      <td class="mono small">${f.fixed_version ? esc(f.fixed_version) : '<span class="muted">no fix</span>'}</td>
+    </tr>`);
+    await modal({
+      title: `${d.findings.length} findings`,
+      okLabel: 'Close',
+      dismissOnly: true,
+      bodyHTML: `<div style="max-height:60vh;overflow:auto">
+        ${tableOrEmpty(rows, '<tr><th>Severity</th><th>Package</th><th>Advisory</th><th>Fixed in</th></tr>',
+          'No known vulnerabilities.')}
+      </div>`,
+    });
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.rescan = async (repo, digest) => {
+  try {
+    await api(`/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}/rescan`,
+      { method: 'POST' });
+    toast('Scan queued — refresh in a moment', 'success');
+  } catch (ex) { toast(ex.message, 'error'); }
+};
 
 /** Render the SBOM panel for a manifest, generated automatically on push. */
 function sbomCard(repo, digest, sbom) {

@@ -41,6 +41,18 @@ type Config struct {
 	SBOMWorkers int
 	// SBOMQueueDepth bounds the backlog of images awaiting a scan.
 	SBOMQueueDepth int
+	// VulnEnabled turns on matching each SBOM against an advisory database.
+	VulnEnabled bool
+	// VulnEndpoint is the OSV-compatible API to query. Point it at a mirror to
+	// run without egress to the public service.
+	VulnEndpoint string
+	// VulnWorkers and VulnQueueDepth size the scan worker pool.
+	VulnWorkers    int
+	VulnQueueDepth int
+	// VulnTimeout bounds a single request to the advisory service.
+	VulnTimeout time.Duration
+	// VulnAdvisoryTTL is how long a cached advisory is reused before refetch.
+	VulnAdvisoryTTL time.Duration
 }
 
 func Load() (*Config, error) {
@@ -56,6 +68,10 @@ func Load() (*Config, error) {
 		SBOMEnabled:        envBool("REGISTRY_SBOM", true),
 		SBOMWorkers:        envInt("REGISTRY_SBOM_WORKERS", 2),
 		SBOMQueueDepth:     envInt("REGISTRY_SBOM_QUEUE", 256),
+		VulnEnabled:        envBool("REGISTRY_VULN_SCAN", true),
+		VulnEndpoint:       env("REGISTRY_VULN_ENDPOINT", "https://api.osv.dev"),
+		VulnWorkers:        envInt("REGISTRY_VULN_WORKERS", 2),
+		VulnQueueDepth:     envInt("REGISTRY_VULN_QUEUE", 256),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -70,6 +86,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.GCUploadTTL, err = envDuration("REGISTRY_GC_UPLOAD_TTL", 24*time.Hour); err != nil {
+		return nil, err
+	}
+	if c.VulnTimeout, err = envDuration("REGISTRY_VULN_TIMEOUT", 60*time.Second); err != nil {
+		return nil, err
+	}
+	if c.VulnAdvisoryTTL, err = envDuration("REGISTRY_VULN_ADVISORY_TTL", 24*time.Hour); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
