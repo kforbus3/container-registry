@@ -23,19 +23,57 @@ $ make conformance
 
 ## Quick start
 
-```bash
-docker compose up -d --build
-docker compose logs registry | grep -A3 'generated password'
-```
+New to this? **[docs/USER-GUIDE.md](docs/USER-GUIDE.md)** walks from an empty
+directory to a pushed image step by step.
 
-Open <http://localhost:5000>, sign in as `admin`, then:
+### Locally, over plain HTTP
 
 ```bash
-docker login localhost:5000
-docker tag alpine:latest localhost:5000/team-a/alpine:1.0
-docker push localhost:5000/team-a/alpine:1.0
-docker pull localhost:5000/team-a/alpine:1.0
+REGISTRY_ADMIN_PASSWORD=choose-something-strong docker compose \
+  -f docker-compose.yml -f docker-compose.local.yml up -d
 ```
+
+Open <http://localhost:5001>, sign in as `admin`, then:
+
+```bash
+docker login localhost:5001
+docker tag alpine:latest localhost:5001/team-a/alpine:1.0
+docker push localhost:5001/team-a/alpine:1.0
+docker pull localhost:5001/team-a/alpine:1.0
+```
+
+Port 5001 rather than 5000 because macOS binds 5000 to the AirPlay Receiver,
+which answers requests instead of the registry. Set `REGISTRY_PORT` to change it.
+
+### Anywhere real: HTTPS on 443
+
+`docker-compose.yml` on its own serves **HTTPS on port 443** and is the default.
+Put a certificate and key in `./certs`, then:
+
+```bash
+REGISTRY_ADMIN_PASSWORD=choose-something-strong docker compose up -d --build
+```
+
+```
+certs/
+  tls.crt    full chain: leaf first, then any intermediates
+  tls.key    readable by uid 10001, the user the registry runs as
+```
+
+The registry listens on 5000 inside the container and is published on 443 on the
+host, so it never needs `CAP_NET_BIND_SERVICE`. To serve on a different host
+port, set `REGISTRY_PORT`; to have the process itself bind 443 (with host
+networking, say), set `REGISTRY_ADDR=:443` and add
+`cap_add: [NET_BIND_SERVICE]`.
+
+TLS is all-or-nothing: with both variables set the registry serves HTTPS only,
+and it refuses to start with just one. The certificate is loaded before the
+listener opens, so a missing or mismatched key pair fails immediately with a
+clear message rather than after announcing itself. Session cookies gain the
+`Secure` flag automatically once TLS is on.
+
+`certs/` and `*.key`/`*.crt`/`*.pem` are in `.gitignore`, so a private key
+cannot be committed by accident.
 
 To run without Docker:
 
@@ -45,9 +83,8 @@ REGISTRY_ADMIN_PASSWORD=choose-something-strong ./bin/registry
 ```
 
 > Docker refuses plain HTTP for any host other than `localhost`/`127.0.0.1`.
-> For anything else, either serve TLS (`REGISTRY_TLS_CERT`/`REGISTRY_TLS_KEY`),
-> put it behind a TLS-terminating proxy, or add the host to Docker's
-> `insecure-registries`.
+> For anything else, either serve TLS as above, put it behind a TLS-terminating
+> proxy, or add the host to Docker's `insecure-registries`.
 
 ---
 
@@ -206,7 +243,7 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `DELETE` | `/api/repositories/<name>/tags/<tag>` | Delete a tag |
 | `GET` | `/api/repositories/<name>/manifests/<digest>` | Manifest, layers, image config, history |
 | `DELETE` | `/api/repositories/<name>/manifests/<digest>` | Delete a manifest and its tags |
-| `GET` | `/api/repositories/<name>/manifests/<digest>/sbom` | Download the generated CycloneDX SBOM |
+| `GET` | `/api/repositories/<name>/manifests/<digest>/sbom` | Download the generated CycloneDX SBOM (`?platform=os/arch` for a multi-platform index) |
 | `GET` `POST` | `/api/tokens` | List / create tokens |
 | `POST` | `/api/tokens/<id>/revoke` | Revoke a token |
 | `DELETE` | `/api/tokens/<id>` | Delete a token record |
@@ -242,14 +279,22 @@ manifest whose `subject` is the image, which makes it a standard referrer:
 
 ```bash
 # Any OCI client can find it — nothing registry-specific involved
-oras discover localhost:5000/team-a/alpine:1.0
+oras discover localhost:5001/team-a/alpine:1.0
 # └── application/vnd.cyclonedx+json
 #     └── sha256:6e61aa6f62d5...
 
 # Or fetch it directly
 curl -u admin:PASSWORD \
-  http://localhost:5000/api/repositories/team-a/alpine/manifests/<digest>/sbom
+  http://localhost:5001/api/repositories/team-a/alpine/manifests/<digest>/sbom
 ```
+
+An SBOM is attached to the image manifest it describes, but a tag usually points
+at an *index* — that is what `docker push` produces even for a single platform.
+The endpoint resolves through the index to the platform manifests beneath it, so
+the digest you have in hand is the one to ask about. A genuinely multi-platform
+index has one SBOM per platform and needs `?platform=linux/amd64` to
+disambiguate; the error lists what is available. The platform actually returned
+comes back in `X-Registry-Sbom-Platform`.
 
 What it detects:
 

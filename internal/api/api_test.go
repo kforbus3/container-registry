@@ -1153,3 +1153,121 @@ func TestUploadDigestAlgorithmParameter(t *testing.T) {
 	resp := h.do(http.MethodPost, "/v2/team-a/algo/blobs/uploads/?digest-algorithm=md5", nil)
 	h.expectStatus(resp, http.StatusBadRequest, "unsupported declared algorithm")
 }
+
+// A tag normally points at an index — that is what `docker push` produces even
+// for a single platform — and an index gets no SBOM of its own. Asking for the
+// SBOM of the digest a user actually has in hand must therefore resolve through
+// the index to the platform manifest beneath it.
+func TestSBOMResolvesThroughIndex(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	child := h.pushImage("team-a/app", "sha-amd64")
+	index, _ := json.Marshal(manifestDoc{
+		SchemaVersion: 2,
+		MediaType:     MediaTypeOCIIndex,
+		Manifests: []descriptor{{
+			MediaType: MediaTypeOCIManifest, Digest: child, Size: 100,
+			Platform: &platform{OS: "linux", Architecture: "amd64"},
+		}},
+	})
+	resp := h.do(http.MethodPut, "/v2/team-a/app/manifests/latest", index, contentType(MediaTypeOCIIndex))
+	h.expectStatus(resp, http.StatusCreated, "put index")
+	indexDigest := store.Digest(index)
+
+	// Before any SBOM exists, both lookups report nothing.
+	resp = h.do(http.MethodGet, "/api/repositories/team-a/app/manifests/"+indexDigest+"/sbom", nil)
+	h.expectStatus(resp, http.StatusNotFound, "index with no SBOM anywhere")
+
+	// Attach an SBOM to the child, exactly as the generator does.
+	attachSBOM(h, "team-a/app", child)
+
+	// Asking the index must now find the child's SBOM.
+	resp = h.do(http.MethodGet, "/api/repositories/team-a/app/manifests/"+indexDigest+"/sbom", nil)
+	body := h.expectStatus(resp, http.StatusOK, "SBOM resolved through the index")
+	if !bytes.Contains(body, []byte("CycloneDX")) {
+		t.Fatalf("unexpected document: %s", body)
+	}
+	if got := resp.Header.Get("X-Registry-Sbom-Platform"); got != "linux/amd64" {
+		t.Errorf("platform header = %q, want linux/amd64", got)
+	}
+
+	// And the manifest detail the UI renders must show it too.
+	var detail struct {
+		SBOM map[string]any `json:"sbom"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories/team-a/app/manifests/"+indexDigest, nil),
+		http.StatusOK, &detail)
+	if detail.SBOM == nil {
+		t.Fatal("manifest detail for an index reported no SBOM")
+	}
+	_ = ctx
+}
+
+// A genuinely multi-platform index has one SBOM per platform, so the caller has
+// to disambiguate rather than silently receive an arbitrary one.
+func TestSBOMMultiPlatformIndexRequiresChoice(t *testing.T) {
+	h := newHarness(t)
+	amd := h.pushImage("team-a/multi", "sha-amd64")
+	arm := h.pushImage("team-a/multi", "sha-arm64", "arm-layer")
+
+	index, _ := json.Marshal(manifestDoc{
+		SchemaVersion: 2, MediaType: MediaTypeOCIIndex,
+		Manifests: []descriptor{
+			{MediaType: MediaTypeOCIManifest, Digest: amd, Size: 100,
+				Platform: &platform{OS: "linux", Architecture: "amd64"}},
+			{MediaType: MediaTypeOCIManifest, Digest: arm, Size: 100,
+				Platform: &platform{OS: "linux", Architecture: "arm64"}},
+		},
+	})
+	h.do(http.MethodPut, "/v2/team-a/multi/manifests/latest", index, contentType(MediaTypeOCIIndex)).Body.Close()
+	indexDigest := store.Digest(index)
+
+	attachSBOM(h, "team-a/multi", amd)
+	attachSBOM(h, "team-a/multi", arm)
+
+	// Ambiguous without a platform, and the error must name the options.
+	resp := h.do(http.MethodGet, "/api/repositories/team-a/multi/manifests/"+indexDigest+"/sbom", nil)
+	body := h.expectStatus(resp, http.StatusBadRequest, "ambiguous multi-platform SBOM")
+	for _, want := range []string{"linux/amd64", "linux/arm64"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("error should list %s; got %s", want, body)
+		}
+	}
+
+	// Naming a platform resolves it.
+	resp = h.do(http.MethodGet,
+		"/api/repositories/team-a/multi/manifests/"+indexDigest+"/sbom?platform=linux/arm64", nil)
+	h.expectStatus(resp, http.StatusOK, "SBOM selected by platform")
+	if got := resp.Header.Get("X-Registry-Sbom-Platform"); got != "linux/arm64" {
+		t.Errorf("platform header = %q", got)
+	}
+
+	// A platform that was never built is a clean 404.
+	resp = h.do(http.MethodGet,
+		"/api/repositories/team-a/multi/manifests/"+indexDigest+"/sbom?platform=windows/amd64", nil)
+	h.expectStatus(resp, http.StatusNotFound, "unknown platform")
+}
+
+// attachSBOM publishes a minimal CycloneDX referrer against a manifest, the
+// same shape the generator produces.
+func attachSBOM(h *harness, repo, subject string) {
+	h.t.Helper()
+	doc := []byte(`{"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}`)
+	docDigest := h.pushBlob(repo, doc)
+	empty := h.pushBlob(repo, []byte("{}"))
+
+	artifact, _ := json.Marshal(manifestDoc{
+		SchemaVersion: 2,
+		MediaType:     MediaTypeOCIManifest,
+		ArtifactType:  "application/vnd.cyclonedx+json",
+		Config:        &descriptor{MediaType: MediaTypeOCIEmptyJSON, Digest: empty, Size: 2},
+		Layers: []descriptor{{
+			MediaType: "application/vnd.cyclonedx+json", Digest: docDigest, Size: int64(len(doc)),
+		}},
+		Subject: &descriptor{MediaType: MediaTypeOCIManifest, Digest: subject, Size: 100},
+	})
+	resp := h.do(http.MethodPut, "/v2/"+repo+"/manifests/"+store.Digest(artifact),
+		artifact, contentType(MediaTypeOCIManifest))
+	h.expectStatus(resp, http.StatusCreated, "attach SBOM referrer")
+}

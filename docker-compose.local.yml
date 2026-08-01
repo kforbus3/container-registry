@@ -1,0 +1,23 @@
+# Local development override: plain HTTP on localhost:5001.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Docker treats localhost and 127.0.0.1 as insecure-capable, so this needs no
+# certificates and no trust configuration. Use it for trying things out; the
+# base compose file serves HTTPS on 443 and is what you want anywhere real.
+#
+# The port is 5001 rather than the conventional 5000 because macOS binds 5000
+# to the AirPlay Receiver, which answers requests instead of the registry.
+# Override with REGISTRY_PORT if 5001 is taken too.
+services:
+  registry:
+    ports: !override
+      - "${REGISTRY_PORT:-5001}:5000"
+    environment:
+      # Empty values disable TLS: the registry requires both or neither.
+      REGISTRY_TLS_CERT: ""
+      REGISTRY_TLS_KEY: ""
+    volumes: !override
+      - registry-data:/var/lib/registry
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/healthz"]

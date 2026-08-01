@@ -6,3 +6,7 @@ coverage.out
 *.db-shm
 .DS_Store
 .conformance/
+certs/
+*.key
+*.crt
+*.pem

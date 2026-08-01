@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -989,9 +990,17 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 
 	// Surface an automatically generated SBOM, if one has been published for
 	// this manifest, so the UI can link to it without a second round trip.
-	if sboms, err := s.DB.Referrers(r.Context(), repo.ID, digest, sbom.MediaType); err == nil && len(sboms) > 0 {
-		summary := map[string]any{"digest": sboms[0].Digest, "artifact_type": sboms[0].ArtifactType}
-		if body, err := s.Store.ReadAll(sboms[0].Digest); err == nil {
+	// Resolving through an index matters here: a tag normally points at one,
+	// and the UI would otherwise show "no SBOM" on the page users actually open.
+	if found, err := s.findSBOMs(r.Context(), repo, digest); err == nil && len(found) > 0 {
+		summary := map[string]any{
+			"digest":    found[0].ArtifactDigest,
+			"platforms": len(found),
+		}
+		if found[0].Platform != "" {
+			summary["platform"] = found[0].Platform
+		}
+		if body, err := s.Store.ReadAll(found[0].ArtifactDigest); err == nil {
 			var art struct {
 				Annotations map[string]string `json:"annotations"`
 			}
@@ -1009,6 +1018,79 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// sbomRef locates one generated SBOM: the artifact holding it, the manifest it
+// describes, and that manifest's platform when it came from an index.
+type sbomRef struct {
+	ArtifactDigest string
+	SubjectDigest  string
+	Platform       string
+}
+
+// findSBOMs resolves the SBOMs reachable from a manifest.
+//
+// An SBOM is attached to the image manifest it describes. A tag, however,
+// usually points at an *index* — that is what `docker push` produces even for a
+// single platform — and an index gets no SBOM of its own. Looking only at the
+// digest the user has in hand would therefore report nothing for the most
+// common case, so an index is resolved to the platform manifests beneath it.
+func (s *Server) findSBOMs(ctx context.Context, repo *db.Repository, digest string) ([]sbomRef, error) {
+	direct, err := s.DB.Referrers(ctx, repo.ID, digest, sbom.MediaType)
+	if err != nil {
+		return nil, err
+	}
+	if len(direct) > 0 {
+		return []sbomRef{{ArtifactDigest: direct[0].Digest, SubjectDigest: digest}}, nil
+	}
+
+	m, err := s.DB.GetManifest(ctx, repo.ID, digest)
+	if err != nil || !isIndexType(m.MediaType) {
+		return nil, nil
+	}
+	body, err := s.Store.ReadAll(digest)
+	if err != nil {
+		return nil, nil
+	}
+	var idx struct {
+		Manifests []struct {
+			Digest   string `json:"digest"`
+			Platform *struct {
+				OS           string `json:"os"`
+				Architecture string `json:"architecture"`
+				Variant      string `json:"variant"`
+			} `json:"platform"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(body, &idx); err != nil {
+		return nil, nil
+	}
+
+	var out []sbomRef
+	for _, child := range idx.Manifests {
+		platform := ""
+		if p := child.Platform; p != nil {
+			// Attestation manifests ride in the index as unknown/unknown and
+			// never carry an SBOM, so they drop out naturally below.
+			platform = p.OS + "/" + p.Architecture
+			if p.Variant != "" {
+				platform += "/" + p.Variant
+			}
+		}
+		refs, err := s.DB.Referrers(ctx, repo.ID, child.Digest, sbom.MediaType)
+		if err != nil {
+			return nil, err
+		}
+		if len(refs) == 0 {
+			continue
+		}
+		out = append(out, sbomRef{
+			ArtifactDigest: refs[0].Digest,
+			SubjectDigest:  child.Digest,
+			Platform:       platform,
+		})
+	}
+	return out, nil
+}
+
 // repoSBOM serves the CycloneDX document generated for a manifest. The SBOM is
 // also reachable through the standard referrers API; this endpoint just saves
 // callers the two extra round trips.
@@ -1021,19 +1103,50 @@ func (s *Server) repoSBOM(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		writeErr(w, http.StatusBadRequest, "invalid digest")
 		return
 	}
-	sboms, err := s.DB.Referrers(r.Context(), repo.ID, digest, sbom.MediaType)
+	found, err := s.findSBOMs(r.Context(), repo, digest)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to look up SBOM")
 		return
 	}
-	if len(sboms) == 0 {
+	if len(found) == 0 {
 		writeErr(w, http.StatusNotFound,
 			"no SBOM has been generated for this manifest yet")
 		return
 	}
+	// A multi-platform index has one SBOM per platform, so the caller has to
+	// say which. A single-platform push — what `docker push` produces by
+	// default — has exactly one, and needs no qualifier.
+	if want := r.URL.Query().Get("platform"); want != "" {
+		filtered := found[:0]
+		for _, c := range found {
+			if c.Platform == want {
+				filtered = append(filtered, c)
+			}
+		}
+		found = filtered
+		if len(found) == 0 {
+			writeErr(w, http.StatusNotFound,
+				fmt.Sprintf("no SBOM for platform %q on this manifest", want))
+			return
+		}
+	}
+	if len(found) > 1 {
+		platforms := make([]string, 0, len(found))
+		for _, c := range found {
+			platforms = append(platforms, c.Platform)
+		}
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+			"this is a multi-platform index with %d SBOMs; add ?platform= to choose one of: %s",
+			len(found), strings.Join(platforms, ", ")))
+		return
+	}
 
+	if found[0].Platform != "" {
+		// Tell the caller which platform they actually got.
+		w.Header().Set("X-Registry-Sbom-Platform", found[0].Platform)
+	}
 	// The artifact manifest carries the document as its single layer.
-	artBody, err := s.Store.ReadAll(sboms[0].Digest)
+	artBody, err := s.Store.ReadAll(found[0].ArtifactDigest)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "SBOM artifact is missing from storage")
 		return

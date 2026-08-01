@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -50,6 +51,16 @@ func run() error {
 
 	if err := bootstrapAdmin(context.Background(), database, cfg, log); err != nil {
 		return err
+	}
+
+	// Load the certificate before announcing anything. Left to ListenAndServeTLS
+	// this fails after the "listening" line, which reads as a server that came
+	// up and then died rather than one that never started.
+	if cfg.TLSEnabled() {
+		if _, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey); err != nil {
+			return fmt.Errorf("TLS is configured but the key pair could not be loaded "+
+				"(cert %q, key %q): %w", cfg.TLSCert, cfg.TLSKey, err)
+		}
 	}
 
 	collector := gc.New(database, st, log)

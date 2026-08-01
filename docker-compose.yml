@@ -7,23 +7,41 @@ services:
     image: container-registry:latest
     container_name: container-registry
     restart: unless-stopped
+
+    # The registry listens on 5000 inside the container and is published on 443
+    # on the host. Binding 443 inside the container instead would need
+    # CAP_NET_BIND_SERVICE, because the process runs as an unprivileged user —
+    # publishing the port sidesteps that entirely. See the README to serve on a
+    # different host port.
     ports:
-      - "${REGISTRY_PORT:-5000}:5000"
+      - "${REGISTRY_PORT:-443}:5000"
+
     environment:
+      # TLS is on by default. Both must be set or neither; the registry refuses
+      # to start with only one, and serves HTTPS exclusively when both are set.
+      REGISTRY_TLS_CERT: /certs/tls.crt
+      REGISTRY_TLS_KEY: /certs/tls.key
+
       # Set this before the first start to choose the initial admin password.
-      # Leave it unset and the generated password is printed once to the log.
+      # Leave it unset and a generated password is printed once to the log.
       REGISTRY_ADMIN_PASSWORD: ${REGISTRY_ADMIN_PASSWORD:-}
       REGISTRY_ADMIN_USER: ${REGISTRY_ADMIN_USER:-admin}
       REGISTRY_ANONYMOUS_PULL: ${REGISTRY_ANONYMOUS_PULL:-false}
       REGISTRY_LOG_LEVEL: ${REGISTRY_LOG_LEVEL:-info}
-      # Uncomment and mount certificates to serve HTTPS directly.
-      # REGISTRY_TLS_CERT: /certs/tls.crt
-      # REGISTRY_TLS_KEY: /certs/tls.key
+
     volumes:
       - registry-data:/var/lib/registry
-      # - ./certs:/certs:ro
+      # tls.crt must be the full chain: leaf first, then any intermediates.
+      # The key has to be readable by uid 10001, the user the registry runs as.
+      - ${REGISTRY_CERT_DIR:-./certs}:/certs:ro
+
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/healthz"]
+      # The probe speaks HTTPS because the registry serves nothing else once
+      # TLS is on. Certificate checking is off only for this loopback probe:
+      # the certificate is issued for the registry's public name, not 127.0.0.1.
+      test:
+        ["CMD", "wget", "-qO-", "--no-check-certificate",
+         "https://127.0.0.1:5000/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3
