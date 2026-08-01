@@ -54,6 +54,14 @@ func (s *Server) LoadRouting(ctx context.Context) error {
 		})
 	}
 	s.Store.Router().Replace(routed, live)
+
+	// Where blobs actually are, which is what reads and writes follow until a
+	// migration moves them.
+	placements, err := s.DB.AllRepoStorage(ctx)
+	if err != nil {
+		return err
+	}
+	s.Store.Router().SetPlacements(placements)
 	if len(routed) > 0 {
 		s.Log.Info("storage routing loaded", "rules", len(routed), "backends", len(live))
 	}
@@ -289,7 +297,7 @@ func (s *Server) handleStorageRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) misplaced(ctx context.Context) []string {
 	router := s.Store.Router()
 	out, err := s.DB.MisplacedRepos(ctx, func(repo string) string {
-		b, _ := router.Resolve(repo)
+		b, _ := router.Target(repo)
 		if b == nil {
 			return ""
 		}

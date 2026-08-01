@@ -35,6 +35,9 @@ type Router struct {
 	rules    []Rule
 	backends map[string]Backend
 	fallback Backend
+	// placements records where each repository's blobs actually are, which is
+	// not always where the rules now say they belong.
+	placements map[string]string
 	// fallbackName is what the default backend is called in the UI and logs.
 	fallbackName string
 }
@@ -44,6 +47,7 @@ type Router struct {
 func NewRouter(fallback Backend) *Router {
 	return &Router{
 		backends:     map[string]Backend{},
+		placements:   map[string]string{},
 		fallback:     fallback,
 		fallbackName: "default",
 	}
@@ -72,11 +76,69 @@ func (r *Router) Fallback() Backend {
 	return r.fallback
 }
 
-// Resolve reports which backend stores a repository's blobs, and the name of
-// the rule that decided it. An empty rule name means the fallback was used.
+// SetPlacements replaces the record of where repositories' blobs actually are.
+func (r *Router) SetPlacements(p map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.placements = p
+}
+
+// SetPlacement records where one repository's blobs went.
+func (r *Router) SetPlacement(repo, backend string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.placements == nil {
+		r.placements = map[string]string{}
+	}
+	r.placements[repo] = backend
+}
+
+// Placement reports where a repository's blobs were last written.
+func (r *Router) Placement(repo string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.placements[repo]
+	return b, ok
+}
+
+// Resolve reports which backend a repository's blobs are read from and written
+// to.
+//
+// Once a repository has content, that is wherever the content already is --
+// never what a rule added afterwards says. A rule change that silently
+// redirected reads would 404 every image the repository already held, and a
+// rule change that redirected only writes would split one repository across two
+// buckets. Both are worse than leaving it where it is until an explicit
+// migration moves it; the difference is surfaced as "misplaced" instead.
 func (r *Router) Resolve(repo string) (Backend, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if placed, ok := r.placements[repo]; ok && placed != "" {
+		if placed == r.fallback.Name() {
+			return r.fallback, "placed"
+		}
+		for _, b := range r.backends {
+			if b != nil && b.Name() == placed {
+				return b, "placed"
+			}
+		}
+		// The backend it was written to is gone. Failing is the only honest
+		// answer: the bytes are not anywhere this registry can currently read.
+		return nil, "placed:" + placed
+	}
+	return r.target(repo)
+}
+
+// Target reports where the rules say a repository's blobs belong, ignoring
+// where they currently are. This is what a migration aims at.
+func (r *Router) Target(repo string) (Backend, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.target(repo)
+}
+
+// target is the rule-based answer. Callers hold the lock.
+func (r *Router) target(repo string) (Backend, string) {
 	for _, rule := range r.rules {
 		if !matchPattern(rule.Pattern, repo) {
 			continue

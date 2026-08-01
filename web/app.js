@@ -1638,6 +1638,252 @@ async function pollMigration() {
   }
 }
 
+/* --------------------------------------------------------- storage routing
+
+Blobs can live in more than one backend, chosen by the repository they belong
+to. These two cards are the whole model: named backends, and the ordered rules
+that send repository names to them. */
+
+function backendsCard(routing) {
+  const backends = routing.backends || [];
+  const rows = backends.map((b) => `<tr>
+    <td><strong>${esc(b.name)}</strong>
+      ${b.healthy ? '' : '<span class="badge danger">unavailable</span>'}</td>
+    <td>${esc(b.kind)}</td>
+    <td class="mono small">${b.kind === 's3'
+      ? `${esc(b.endpoint || '(aws)')}/${esc(b.bucket || '')}`
+      : '<span class="muted">local disk</span>'}</td>
+    <td class="actions">
+      <button class="btn ghost small" onclick="checkBackend('${jsq(b.name)}',this)">Test</button>
+      <button class="btn ghost small danger" onclick="deleteBackend('${jsq(b.name)}')">Delete</button>
+    </td>
+  </tr>`);
+
+  return `<div class="card">
+    <h2>Storage backends</h2>
+    <p class="muted small" style="margin-top:-.4rem">
+      Places blobs can live, beyond the default. A backend does nothing until a
+      routing rule sends repositories to it.</p>
+    ${tableOrEmpty(rows,
+      '<tr><th>Name</th><th>Kind</th><th>Location</th><th></th></tr>',
+      'No additional backends. Everything uses the default.')}
+    <dl class="kv" style="margin-top:.8rem">
+      <dt>Default</dt><dd class="mono">${esc(routing.default || '')}</dd>
+    </dl>
+    <div class="row" style="margin-top:.8rem">
+      <button class="btn" onclick="addBackend()">Add backend</button>
+    </div>
+  </div>`;
+}
+
+function rulesCard(routing) {
+  const rules = routing.rules || [];
+  const backends = routing.backends || [];
+  const misplaced = routing.misplaced || [];
+
+  const rows = rules.map((r, i) => `<tr>
+    <td class="num muted">${r.priority}</td>
+    <td class="mono">${esc(r.pattern)}</td>
+    <td>${esc(r.backend)}</td>
+    <td class="actions">
+      ${i > 0 ? `<button class="btn ghost small" title="Evaluate earlier"
+        onclick="moveStorageRule(${r.id},${r.priority - 15})">↑</button>` : ''}
+      ${i < rules.length - 1 ? `<button class="btn ghost small" title="Evaluate later"
+        onclick="moveStorageRule(${r.id},${r.priority + 15})">↓</button>` : ''}
+      <button class="btn ghost small danger" onclick="deleteStorageRule(${r.id})">Delete</button>
+    </td>
+  </tr>`);
+  // The fallback is shown as the last row because that is exactly how it
+  // behaves: the rule that matches whatever nothing else claimed.
+  rows.push(`<tr class="muted">
+    <td class="num">—</td><td class="mono">*</td>
+    <td>${esc(routing.default || '')}</td>
+    <td class="small">default, always last</td>
+  </tr>`);
+
+  return `<div class="card">
+    <h2>Routing rules</h2>
+    <p class="muted small" style="margin-top:-.4rem">
+      Checked in order; the first pattern that matches a repository name decides
+      where its blobs go. <code>*</code> matches any run of characters including
+      <code>/</code>, so <code>gov/*</code> covers <code>gov/team/app</code>.</p>
+    ${tableOrEmpty(rows,
+      '<tr><th class="num">Order</th><th>Pattern</th><th>Backend</th><th></th></tr>', '')}
+    ${misplaced.length ? `<div class="card" style="margin-top:1rem;background:var(--bg)">
+      <h3>${misplaced.length} repositor${misplaced.length === 1 ? 'y is' : 'ies are'} not where the rules say</h3>
+      <p class="muted small">Changing a rule does not move anything already
+        stored. These still have their blobs in the backend they were pushed to:</p>
+      <p class="mono small">${misplaced.slice(0, 12).map(esc).join(', ')}${
+        misplaced.length > 12 ? ` and ${misplaced.length - 12} more` : ''}</p>
+      <p class="muted small">Nothing is broken by this: reads and writes for a
+        repository keep following the backend its blobs are already in, so pulls
+        and pushes carry on working. New repositories matching the rule go
+        straight to the new backend. Moving the existing ones is a
+        per-repository migration.</p>
+    </div>` : ''}
+    <div class="row" style="margin-top:.8rem">
+      <button class="btn" onclick="addStorageRule()"
+        ${backends.length ? '' : 'disabled title="Add a backend first"'}>Add rule</button>
+    </div>
+  </div>`;
+}
+
+/** Fields shared by the add-backend form and the default-storage form. */
+function s3FieldsHTML(prefix) {
+  return `
+    <div class="field"><label>Endpoint</label>
+      <input name="${prefix}endpoint" placeholder="http://minio:9000">
+      <span class="hint">Leave blank for AWS, which is derived from the region.</span></div>
+    <div class="field"><label>Bucket</label>
+      <input name="${prefix}bucket" placeholder="registry-blobs"></div>
+    <div class="field"><label>Region</label>
+      <input name="${prefix}region" placeholder="us-gov-west-1"></div>
+    <div class="field"><label>Key prefix</label>
+      <input name="${prefix}prefix" placeholder="optional"></div>
+    <div class="field"><label>Access key</label>
+      <input name="${prefix}access_key"></div>
+    <div class="field"><label>Secret key</label>
+      <input name="${prefix}secret_key" type="password"></div>`;
+}
+
+window.addBackend = async () => {
+  const v = await modal({
+    title: 'Add a storage backend',
+    okLabel: 'Test and add',
+    bodyHTML: `
+      <div class="field"><label>Name</label>
+        <input name="name" placeholder="govcloud">
+        <span class="hint">How rules refer to it. Not the bucket name.</span></div>
+      <div class="field"><label>Kind</label>
+        <select name="kind" id="nb-kind">
+          <option value="s3">S3-compatible object store</option>
+          <option value="filesystem">Local directory</option>
+        </select></div>
+      <div id="nb-s3">${s3FieldsHTML('')}</div>
+      <div id="nb-fs" hidden>
+        <div class="field"><label>Directory suffix</label>
+          <input name="fs_prefix" placeholder="archive">
+          <span class="hint">Stored under the data directory as
+            <code>blobs-&lt;suffix&gt;</code>, so it is a separate store rather
+            than another name for the default.</span></div>
+      </div>
+      <p class="muted small">The settings are proved against the real backend
+        before being saved: a write, a read back and a delete.</p>`,
+    onOpen: (body) => {
+      const kind = body.querySelector('#nb-kind');
+      kind.addEventListener('change', () => {
+        body.querySelector('#nb-s3').hidden = kind.value !== 's3';
+        body.querySelector('#nb-fs').hidden = kind.value !== 'filesystem';
+      });
+    },
+  });
+  if (!v) return;
+  if (!v.name.trim()) { toast('A name is required', 'error'); return; }
+
+  const body = { name: v.name.trim(), kind: v.kind };
+  if (v.kind === 's3') {
+    if (!v.bucket.trim()) { toast('A bucket is required', 'error'); return; }
+    Object.assign(body, {
+      endpoint: v.endpoint.trim(), bucket: v.bucket.trim(), region: v.region.trim(),
+      prefix: v.prefix.trim(), access_key: v.access_key.trim(),
+      secret_key: v.secret_key, path_style: true,
+    });
+  } else {
+    body.prefix = (v.fs_prefix || '').trim();
+    if (!body.prefix) { toast('A directory suffix is required', 'error'); return; }
+  }
+  try {
+    await api('/storage/backends', { method: 'POST', body: JSON.stringify(body) });
+    toast(`Added ${body.name}`, 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.deleteBackend = async (name) => {
+  if (!await confirmDanger('Delete backend',
+    `Delete "${name}"? Blobs already written to it are left alone — this only ` +
+    `removes the registry's knowledge of it, and is refused while a rule still ` +
+    `points at it.`)) return;
+  try {
+    await api(`/storage/backends/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Deleted ${name}`, 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.checkBackend = async (name, btn) => {
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Testing…';
+  try {
+    const r = await api(`/storage/check?backend=${encodeURIComponent(name)}`, { method: 'POST' });
+    toast(r.ok ? `${name} is reachable and writable (${r.latency_ms} ms)`
+               : `${name} failed at ${r.stage}: ${r.error}`,
+      r.ok ? 'success' : 'error');
+  } catch (ex) { toast(ex.message, 'error'); }
+  btn.disabled = false;
+  btn.textContent = label;
+};
+
+window.addStorageRule = async () => {
+  const routing = (await api('/settings')).routing || {};
+  const options = (routing.backends || [])
+    .map((b) => `<option value="${esc(b.name)}">${esc(b.name)}</option>`).join('');
+  const v = await modal({
+    title: 'Add a routing rule',
+    okLabel: 'Add rule',
+    bodyHTML: `
+      <div class="field"><label>Repository pattern</label>
+        <input name="pattern" placeholder="gov/*">
+        <span class="hint"><code>*</code> spans <code>/</code>, so
+          <code>gov/*</code> also covers <code>gov/team/app</code>.</span></div>
+      <div class="field"><label>Backend</label>
+        <select name="backend">${options}</select></div>
+      <div class="field"><label>Order</label>
+        <input name="priority" value="100">
+        <span class="hint">Lower is checked first. Put specific patterns above
+          general ones.</span></div>
+      <p class="muted small">Adding a rule does not move anything already
+        stored. Repositories that end up in the wrong place are listed after
+        saving.</p>`,
+  });
+  if (!v) return;
+  if (!v.pattern.trim()) { toast('A pattern is required', 'error'); return; }
+  try {
+    const r = await api('/storage/rules', {
+      method: 'POST',
+      body: JSON.stringify({
+        pattern: v.pattern.trim(), backend: v.backend,
+        priority: parseInt(v.priority, 10) || 100,
+      }),
+    });
+    toast((r.misplaced && r.misplaced.length)
+      ? `Rule added — ${r.misplaced.length} repositor${r.misplaced.length === 1 ? 'y is' : 'ies are'} now misplaced`
+      : 'Rule added', 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.deleteStorageRule = async (id) => {
+  if (!await confirmDanger('Delete rule',
+    'Repositories this rule covers will fall through to the next matching rule, ' +
+    'or to the default. Blobs already stored do not move.')) return;
+  try {
+    await api(`/storage/rules/${id}`, { method: 'DELETE' });
+    toast('Rule deleted', 'success');
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.moveStorageRule = async (id, priority) => {
+  try {
+    await api(`/storage/rules/${id}`, {
+      method: 'PATCH', body: JSON.stringify({ priority }),
+    });
+    route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
 async function renderMaintenance(view) {
   const [gcState, settings, stats, maint] = await Promise.all([
     api('/gc'), api('/settings'), api('/stats'), api('/maintenance'),
@@ -1697,6 +1943,10 @@ async function renderMaintenance(view) {
         ${storageFormHTML(st)}
       </div>
     </div>
+
+    ${backendsCard(settings.routing || {})}
+
+    ${rulesCard(settings.routing || {})}
 
     <div class="card">
       <h2>Scheduled maintenance</h2>
