@@ -483,13 +483,101 @@ function stat(label, value, sub = '') {
 
 // ---- repositories
 
-async function renderRepositories(view) {
-  const data = await api('/repositories');
-  const repos = data.repositories || [];
+/**
+ * Group repositories into the folder one level below `prefix`.
+ *
+ * Repository names are paths -- `demo/alpine`, `team-a/svc/api` -- and a flat
+ * list of them stops being readable well before a registry stops being small.
+ * This turns that list into one level of a tree: the folders directly under the
+ * prefix, and the repositories that sit at this level rather than deeper.
+ *
+ * A name can be both: a registry may hold `demo` and `demo/alpine` at once, in
+ * which case `demo` is a repository *and* a folder, and both are shown.
+ */
+function groupRepos(repos, prefix) {
+  const base = prefix ? `${prefix}/` : '';
+  const folders = new Map();
+  const leaves = [];
 
-  const rows = repos.map((r) => `<tr>
+  for (const r of repos) {
+    if (prefix && r.name !== prefix && !r.name.startsWith(base)) continue;
+    // The prefix itself, when a repository of that exact name exists.
+    if (prefix && r.name === prefix) { leaves.push(r); continue; }
+
+    const rest = prefix ? r.name.slice(base.length) : r.name;
+    const cut = rest.indexOf('/');
+    if (cut < 0) { leaves.push(r); continue; }
+
+    const seg = rest.slice(0, cut);
+    let f = folders.get(seg);
+    if (!f) {
+      f = { name: seg, path: base + seg, count: 0, tags: 0, size: 0, updated: null };
+      folders.set(seg, f);
+    }
+    // Aggregates cover everything beneath the folder, not just its next level:
+    // a count that stopped at one level would make a deep namespace look empty.
+    f.count += 1;
+    f.tags += r.tag_count || 0;
+    f.size += r.size_bytes || 0;
+    if (!f.updated || (r.updated_at && r.updated_at > f.updated)) f.updated = r.updated_at;
+  }
+
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  return { folders: [...folders.values()].sort(byName), leaves: leaves.sort(byName) };
+}
+
+/** Breadcrumb trail for the current folder, each segment navigable. */
+function repoCrumbs(prefix) {
+  if (!prefix) return '<div class="crumbs">Repositories</div>';
+  const parts = prefix.split('/');
+  const links = parts.map((seg, i) => {
+    const path = parts.slice(0, i + 1).join('/');
+    return i === parts.length - 1
+      ? esc(seg)
+      : `<a href="#/repositories/${encodeURIComponent(path)}">${esc(seg)}</a>`;
+  });
+  return `<div class="crumbs"><a href="#/repositories">Repositories</a> / ${links.join(' / ')}</div>`;
+}
+
+/** Crumb links from the root down to (but not including) a repository. */
+function folderTrail(name) {
+  const parts = name.split('/');
+  let out = '<a href="#/repositories">Repositories</a> / ';
+  for (let i = 0; i < parts.length - 1; i++) {
+    const path = parts.slice(0, i + 1).join('/');
+    out += `<a href="#/repositories/${encodeURIComponent(path)}">${esc(parts[i])}</a> / `;
+  }
+  return out;
+}
+
+async function renderRepositories(view, [prefixArg]) {
+  const prefix = prefixArg ? decodeURIComponent(prefixArg).replace(/^\/+|\/+$/g, '') : '';
+  const data = await api('/repositories');
+  const all = data.repositories || [];
+  const { folders, leaves } = groupRepos(all, prefix);
+
+  if (prefix && folders.length === 0 && leaves.length === 0) {
+    view.innerHTML = repoCrumbs(prefix) + pageHead(prefix, 'Nothing here') +
+      `<div class="card"><div class="empty">No repositories under
+        <code>${esc(prefix)}</code>. It may have been deleted.</div>
+        <div class="row" style="margin-top:.8rem">
+          <a class="btn" href="#/repositories">Back to all repositories</a></div></div>`;
+    return;
+  }
+
+  const folderRows = folders.map((f) => `<tr data-name="${esc(f.path)}">
     <td>
-      <a href="#/repo/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
+      <a href="#/repositories/${encodeURIComponent(f.path)}">${esc(f.name)}/</a>
+      <div class="muted small">${f.count} repositor${f.count === 1 ? 'y' : 'ies'}</div>
+    </td>
+    <td class="num">${f.tags}</td>
+    <td class="num">${esc(bytes(f.size))}</td>
+    <td class="muted small" title="${esc(fullDate(f.updated))}">${esc(ago(f.updated))}</td>
+  </tr>`);
+
+  const leafRows = leaves.map((r) => `<tr data-name="${esc(r.name)}">
+    <td>
+      <a href="#/repo/${encodeURIComponent(r.name)}">${esc(shortName(r.name, prefix))}</a>
       ${r.public ? '<span class="badge ok">public</span>' : ''}
       ${r.immutable ? '<span class="badge warn">immutable</span>' : ''}
       ${r.description ? `<div class="muted small">${esc(r.description)}</div>` : ''}
@@ -499,24 +587,75 @@ async function renderRepositories(view) {
     <td class="muted small" title="${esc(fullDate(r.updated_at))}">${esc(ago(r.updated_at))}</td>
   </tr>`);
 
-  view.innerHTML = pageHead('Repositories',
-    `${repos.length} repositor${repos.length === 1 ? 'y' : 'ies'} visible to you`) +
+  const shown = folders.length + leaves.length;
+  const subtitle = prefix
+    ? `${shown} item${shown === 1 ? '' : 's'} under <code>${esc(prefix)}</code>`
+    : `${all.length} repositor${all.length === 1 ? 'y' : 'ies'} visible to you`;
+
+  view.innerHTML = repoCrumbs(prefix) +
+    pageHead(prefix ? prefix.split('/').pop() : 'Repositories', subtitle,
+      prefix ? '<a class="btn ghost" href="#/repositories">All repositories</a>' : '') +
     `<div class="card">
-      <div class="field"><input id="repo-filter" placeholder="Filter repositories…"></div>
-      ${tableOrEmpty(rows,
-        '<tr><th>Name</th><th class="num">Tags</th><th class="num">Size</th><th>Updated</th></tr>',
-        'No repositories yet. Push an image to create one.')}
+      <div class="field">
+        <input id="repo-filter" placeholder="Filter repositories…">
+        <span class="hint">Searches every repository by full name, not just this folder.</span>
+      </div>
+      <div id="repo-browse">
+        ${tableOrEmpty(folderRows.concat(leafRows),
+          '<tr><th>Name</th><th class="num">Tags</th><th class="num">Size</th><th>Updated</th></tr>',
+          'No repositories yet. Push an image to create one.')}
+      </div>
+      <div id="repo-search" hidden></div>
     </div>`;
 
-  const filter = $('#repo-filter');
-  if (filter) {
-    filter.addEventListener('input', () => {
-      const q = filter.value.toLowerCase();
-      $$('#view tbody tr').forEach((tr) => {
-        tr.hidden = !tr.textContent.toLowerCase().includes(q);
-      });
-    });
-  }
+  bindRepoFilter(all, prefix);
+}
+
+/** Trim the folder path off a repository name, so a row reads `alpine`
+ *  rather than `demo/alpine` when already inside `demo`. */
+function shortName(name, prefix) {
+  if (!prefix) return name;
+  return name === prefix ? name : name.slice(prefix.length + 1);
+}
+
+/**
+ * Filtering searches the whole registry rather than the current folder.
+ *
+ * Hiding rows in place would be simpler, but it would answer "no results" for a
+ * repository that is merely in a different folder -- which, in a UI whose whole
+ * point is that repositories live in folders, is the wrong answer.
+ */
+function bindRepoFilter(all, prefix) {
+  const input = $('#repo-filter');
+  const browse = $('#repo-browse');
+  const results = $('#repo-search');
+  if (!input || !browse || !results) return;
+
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    if (!q) {
+      browse.hidden = false;
+      results.hidden = true;
+      return;
+    }
+    const hits = all.filter((r) => r.name.toLowerCase().includes(q));
+    const rows = hits.map((r) => `<tr>
+      <td>
+        <a href="#/repo/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
+        ${r.public ? '<span class="badge ok">public</span>' : ''}
+      </td>
+      <td class="num">${r.tag_count}</td>
+      <td class="num">${esc(bytes(r.size_bytes))}</td>
+      <td class="muted small">${esc(ago(r.updated_at))}</td>
+    </tr>`);
+    results.innerHTML = `<p class="muted small">${hits.length} of ${all.length}
+      repositories match <code>${esc(q)}</code>, across every folder.</p>` +
+      tableOrEmpty(rows,
+        '<tr><th>Name</th><th class="num">Tags</th><th class="num">Size</th><th>Updated</th></tr>',
+        'No repository name contains that.');
+    browse.hidden = true;
+    results.hidden = false;
+  });
 }
 
 // ---- repository detail
@@ -574,7 +713,7 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
   </tr>`);
 
   view.innerHTML = `
-    <div class="crumbs"><a href="#/repositories">Repositories</a> / ${esc(repo.name)}</div>
+    <div class="crumbs">${folderTrail(repo.name)} ${esc(repo.name.split('/').pop())}</div>
     ${pageHead(repo.name, repo.description ? esc(repo.description) : 'No description',
       `${canWrite ? `<button class="btn" onclick="createTag('${jsq(repo.name)}')">New tag</button>` : ''}
        ${canWrite ? `<button class="btn ghost" onclick="editRepo('${jsq(repo.name)}')">Settings</button>` : ''}
@@ -833,8 +972,9 @@ async function renderManifest(view, [repo, digest]) {
 
   view.innerHTML = `
     <div class="crumbs">
-      <a href="#/repositories">Repositories</a> /
-      <a href="#/repo/${encodeURIComponent(repo)}">${esc(repo)}</a> / ${esc(shortDigest(digest))}
+      ${folderTrail(repo)}
+      <a href="#/repo/${encodeURIComponent(repo)}">${esc(repo.split('/').pop())}</a> /
+      ${esc(shortDigest(digest))}
     </div>
     ${pageHead(shortDigest(digest), esc(m.media_type),
       `<button class="btn ghost" onclick="copy('${jsq(digest)}')">Copy digest</button>

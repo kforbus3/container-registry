@@ -192,7 +192,8 @@ this registry.
 
 **Management**
 
-- Web UI: repository browser with paged and searchable tags, layer inspection,
+- Web UI: repositories browsed as a folder tree by namespace — `demo/` opens to
+  what is under it — with paged and searchable tags, layer inspection,
   image config and build history, token issue/revoke, user management, audit
   log, retention rules, webhooks and maintenance
 - Prometheus metrics at `/metrics`, with bounded label cardinality
