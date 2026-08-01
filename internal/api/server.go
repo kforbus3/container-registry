@@ -22,6 +22,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
 	"github.com/kforbus3/container-registry/internal/vuln"
+	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
 // Server wires together storage, metadata and authentication behind the HTTP
@@ -41,6 +42,7 @@ type Server struct {
 
 	reads  *ratelimit.Limiter
 	writes *ratelimit.Limiter
+	hooks  *webhook.Dispatcher
 }
 
 // SetRateLimits installs per-caller limits. Writes are limited separately
@@ -238,6 +240,19 @@ func remoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// emit publishes a registry event to any subscribed webhooks. A nil dispatcher
+// makes this a no-op, so call sites need no guard.
+func (s *Server) emit(r *http.Request, repoID int64, event, repo, reference, digest string) {
+	if s.hooks == nil {
+		return
+	}
+	s.hooks.Emit(webhook.Event{
+		Event: event, RepoID: repoID,
+		Repository: repo, Reference: reference, Digest: digest,
+		Actor: principalFrom(r.Context()).Display(),
+	})
 }
 
 func (s *Server) audit(r *http.Request, action, repo, reference, detail string) {

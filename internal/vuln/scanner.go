@@ -40,6 +40,10 @@ type Scanner struct {
 	// than a permanent cache.
 	AdvisoryTTL time.Duration
 
+	// OnComplete, when set, is called after a scan is stored. It is how
+	// webhook delivery is chained on without this package knowing about it.
+	OnComplete func(repoID int64, repoName, digest string, critical, high int)
+
 	queue chan Job
 	wg    sync.WaitGroup
 
@@ -160,6 +164,9 @@ func (s *Scanner) run(ctx context.Context, job Job) {
 		s.Log.Error("vulnerability scan failed",
 			"repo", job.RepoName, "digest", job.Digest, "err", err)
 		return
+	}
+	if scan != nil && s.OnComplete != nil {
+		s.OnComplete(job.RepoID, job.RepoName, job.Digest, scan.Critical, scan.High)
 	}
 	if scan != nil {
 		s.Log.Info("vulnerability scan complete",

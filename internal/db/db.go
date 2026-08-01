@@ -251,6 +251,41 @@ CREATE TABLE maintenance_runs (
 );
 CREATE INDEX idx_maintenance_started ON maintenance_runs(started_at DESC);
 `},
+
+	{"004_webhooks", `
+-- A webhook with repo_id NULL fires for the whole registry; otherwise it is
+-- scoped to one repository.
+CREATE TABLE webhooks (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_id    INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
+	name       TEXT    NOT NULL,
+	url        TEXT    NOT NULL,
+	secret     TEXT    NOT NULL DEFAULT '',
+	events     TEXT    NOT NULL DEFAULT '*',
+	enabled    INTEGER NOT NULL DEFAULT 1,
+	created_at TEXT    NOT NULL,
+	last_status INTEGER NOT NULL DEFAULT 0,
+	last_error  TEXT   NOT NULL DEFAULT '',
+	last_sent_at TEXT  NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_webhooks_repo ON webhooks(repo_id);
+
+-- Delivery history, so a webhook that is not arriving can be diagnosed from
+-- the registry rather than from the receiver's logs.
+CREATE TABLE webhook_deliveries (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	webhook_id  INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+	event       TEXT    NOT NULL,
+	repository  TEXT    NOT NULL DEFAULT '',
+	reference   TEXT    NOT NULL DEFAULT '',
+	status_code INTEGER NOT NULL DEFAULT 0,
+	error       TEXT    NOT NULL DEFAULT '',
+	attempts    INTEGER NOT NULL DEFAULT 1,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	sent_at     TEXT    NOT NULL
+);
+CREATE INDEX idx_deliveries_hook ON webhook_deliveries(webhook_id, id DESC);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

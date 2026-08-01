@@ -551,8 +551,10 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, name, ref s
 			return
 		}
 		s.audit(r, "push.tag", name, ref, digest)
+		s.emit(r, repo.ID, db.EventPushTag, name, ref, digest)
 	} else {
 		s.audit(r, "push.manifest", name, digest, parsed.MediaType)
+		s.emit(r, repo.ID, db.EventPushManifest, name, digest, digest)
 		// Optional spec feature: a manifest pushed by digest may carry `tag`
 		// query parameters, letting a client publish several tags in one
 		// request. Each accepted tag is echoed in an OCI-Tag header.
@@ -630,6 +632,7 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, name, re
 			return
 		}
 		s.audit(r, "delete.tag", name, ref, "")
+		s.emit(r, repo.ID, db.EventDeleteTag, name, ref, "")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -642,6 +645,7 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, name, re
 		return
 	}
 	s.audit(r, "delete.manifest", name, ref, "")
+	s.emit(r, repo.ID, db.EventDeleteManifest, name, ref, ref)
 	w.WriteHeader(http.StatusAccepted)
 }
 

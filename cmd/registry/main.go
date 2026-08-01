@@ -23,6 +23,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
 	"github.com/kforbus3/container-registry/internal/vuln"
+	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
 func main() {
@@ -96,6 +97,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Webhooks are started first so everything below can emit into them.
+	var hooks *webhook.Dispatcher
+	if cfg.WebhooksEnabled {
+		hooks = webhook.New(database, log, cfg.WebhookQueue, cfg.WebhookTimeout)
+		hooks.Start(ctx, cfg.WebhookWorkers)
+		srv.SetWebhooks(hooks)
+		defer hooks.Wait()
+		log.Info("webhooks enabled", "workers", cfg.WebhookWorkers)
+	}
+
 	// Vulnerability scanning consumes the SBOMs, so it is started first and
 	// chained to the generator below.
 	var scanner *vuln.Scanner
@@ -103,6 +114,16 @@ func run() error {
 		scanner = vuln.New(database, st,
 			vuln.NewClient(cfg.VulnEndpoint, cfg.VulnTimeout), log, cfg.VulnQueueDepth)
 		scanner.AdvisoryTTL = cfg.VulnAdvisoryTTL
+		if hooks != nil {
+			// A completed scan is the event people actually want to gate on.
+			scanner.OnComplete = func(repoID int64, repoName, digest string, critical, high int) {
+				hooks.Emit(webhook.Event{
+					Event: db.EventScanComplete, RepoID: repoID,
+					Repository: repoName, Digest: digest, Actor: "registry",
+					Data: map[string]any{"critical": critical, "high": high},
+				})
+			}
+		}
 		scanner.Start(ctx, cfg.VulnWorkers)
 		srv.SetVulnScanner(scanner)
 		defer scanner.Wait()

@@ -16,6 +16,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
 	"github.com/kforbus3/container-registry/internal/vuln"
+	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
 // GC is set by main so the admin API can trigger collection.
@@ -27,6 +28,10 @@ func (s *Server) SetSBOMGenerator(g *sbom.Generator) { s.sbom = g }
 
 // SetVulnScanner wires in vulnerability scanning. A nil scanner disables it.
 func (s *Server) SetVulnScanner(v *vuln.Scanner) { s.vuln = v }
+
+// SetWebhooks wires in event delivery. A nil dispatcher disables it, and Emit
+// on a nil dispatcher is a no-op, so call sites need no guard.
+func (s *Server) SetWebhooks(d *webhook.Dispatcher) { s.hooks = d }
 
 // SetScheduler wires in scheduled maintenance and the retention engine it uses.
 func (s *Server) SetScheduler(sc *gc.Scheduler) {
@@ -61,6 +66,12 @@ func (s *Server) adminRouter() http.Handler {
 	mux.Handle("POST /gc", s.requireAdmin(s.handleGCRun))
 
 	mux.Handle("GET /settings", s.requireAdmin(s.handleSettingsGet))
+
+	mux.Handle("GET /webhooks", s.requireAdmin(s.handleWebhookList))
+	mux.Handle("POST /webhooks", s.requireAdmin(s.handleWebhookCreate))
+	mux.Handle("DELETE /webhooks/{id}", s.requireAdmin(s.handleWebhookDelete))
+	mux.Handle("GET /webhooks/{id}/deliveries", s.requireAdmin(s.handleWebhookDeliveries))
+	mux.Handle("POST /webhooks/{id}/test", s.requireAdmin(s.handleWebhookTest))
 
 	mux.Handle("GET /maintenance", s.requireAdmin(s.handleMaintenanceHistory))
 	mux.Handle("POST /maintenance/sweep", s.requireAdmin(s.handleMaintenanceSweep))
@@ -638,6 +649,130 @@ func validUsername(s string) bool {
 	return true
 }
 
+// ---------------------------------------------------------------- webhooks
+
+func (s *Server) handleWebhookList(w http.ResponseWriter, r *http.Request) {
+	var repoID int64
+	if name := r.URL.Query().Get("repository"); name != "" {
+		repo, err := s.DB.GetRepository(r.Context(), name)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no such repository")
+			return
+		}
+		repoID = repo.ID
+	}
+	hooks, err := s.DB.ListWebhooks(r.Context(), repoID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to list webhooks")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"webhooks": hooks, "events": db.AllEvents})
+}
+
+func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name       string `json:"name"`
+		URL        string `json:"url"`
+		Secret     string `json:"secret"`
+		Events     string `json:"events"`
+		Repository string `json:"repository"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Name, req.URL = strings.TrimSpace(req.Name), strings.TrimSpace(req.URL)
+	if req.Name == "" || req.URL == "" {
+		writeErr(w, http.StatusBadRequest, "name and url are required")
+		return
+	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		writeErr(w, http.StatusBadRequest, "url must be http or https")
+		return
+	}
+	if req.Events == "" {
+		req.Events = "*"
+	}
+	hook := &db.Webhook{
+		Name: req.Name, URL: req.URL, Secret: req.Secret,
+		Events: req.Events, Enabled: true,
+	}
+	if req.Repository != "" {
+		repo, err := s.DB.GetRepository(r.Context(), req.Repository)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no such repository")
+			return
+		}
+		hook.RepoID = &repo.ID
+	}
+	created, err := s.DB.CreateWebhook(r.Context(), hook)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create webhook")
+		return
+	}
+	s.audit(r, "webhook.create", req.Repository, req.Name, req.URL)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) handleWebhookDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid webhook id")
+		return
+	}
+	if err := s.DB.DeleteWebhook(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to delete webhook")
+		return
+	}
+	s.audit(r, "webhook.delete", "", r.PathValue("id"), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid webhook id")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	deliveries, err := s.DB.Deliveries(r.Context(), id, limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read deliveries")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deliveries": deliveries})
+}
+
+// handleWebhookTest sends a synthetic event, so an endpoint can be verified
+// without waiting for a real push.
+func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
+	if s.hooks == nil {
+		writeErr(w, http.StatusServiceUnavailable, "webhooks are disabled")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid webhook id")
+		return
+	}
+	hook, err := s.DB.GetWebhook(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such webhook")
+		return
+	}
+	var repoID int64
+	if hook.RepoID != nil {
+		repoID = *hook.RepoID
+	}
+	s.hooks.Emit(webhook.Event{
+		Event: db.EventPushTag, RepoID: repoID,
+		Repository: "test", Reference: "test",
+		Actor: principalFrom(r.Context()).Display(),
+		Data:  map[string]any{"test": true},
+	})
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "test event queued"})
+}
+
 // ---------------------------------------------------------------- retention
 
 // mustRetentionRules returns a repository's rules, or an empty list if they
@@ -1131,6 +1266,7 @@ func (s *Server) createTag(w http.ResponseWriter, r *http.Request, repo *db.Repo
 		return
 	}
 	s.audit(r, "tag.create", repo.Name, req.Tag, digest)
+	s.emit(r, repo.ID, db.EventPushTag, repo.Name, req.Tag, digest)
 	writeJSON(w, http.StatusCreated, map[string]string{"tag": req.Tag, "digest": digest})
 }
 
@@ -1159,6 +1295,7 @@ func (s *Server) repoTag(w http.ResponseWriter, r *http.Request, repo *db.Reposi
 			return
 		}
 		s.audit(r, "tag.delete", repo.Name, tag, "")
+		s.emit(r, repo.ID, db.EventDeleteTag, repo.Name, tag, "")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 
 	default:

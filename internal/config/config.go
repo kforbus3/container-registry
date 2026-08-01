@@ -64,6 +64,13 @@ type Config struct {
 	RateBurst int
 	// RateLimitWrites separately bounds pushes, which cost far more than reads.
 	RateLimitWrites int
+	// WebhooksEnabled turns on event delivery to registered endpoints.
+	WebhooksEnabled bool
+	// WebhookWorkers and WebhookQueue size the delivery pool.
+	WebhookWorkers int
+	WebhookQueue   int
+	// WebhookTimeout bounds a single delivery attempt.
+	WebhookTimeout time.Duration
 }
 
 func Load() (*Config, error) {
@@ -86,6 +93,9 @@ func Load() (*Config, error) {
 		RateLimit:          envInt("REGISTRY_RATE_LIMIT", 0),
 		RateBurst:          envInt("REGISTRY_RATE_BURST", 0),
 		RateLimitWrites:    envInt("REGISTRY_RATE_LIMIT_WRITES", 0),
+		WebhooksEnabled:    envBool("REGISTRY_WEBHOOKS", true),
+		WebhookWorkers:     envInt("REGISTRY_WEBHOOK_WORKERS", 2),
+		WebhookQueue:       envInt("REGISTRY_WEBHOOK_QUEUE", 512),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -112,6 +122,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.MaintenanceDelay, err = envDuration("REGISTRY_MAINTENANCE_DELAY", 5*time.Minute); err != nil {
+		return nil, err
+	}
+	if c.WebhookTimeout, err = envDuration("REGISTRY_WEBHOOK_TIMEOUT", 10*time.Second); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {

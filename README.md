@@ -161,6 +161,16 @@ referrer attached by ORAS, discovered back through the referrers API.
 - Every push, delete, tag and administrative change is written to an audit log
 - Per-caller rate limiting, with pushes limited separately from reads
 
+**Webhooks**
+
+- Signed deliveries on push, delete and scan-complete, with per-hook event
+  filters and registry-wide or per-repository scope
+- HMAC-SHA256 over timestamp and body, so a receiver can verify the delivery
+  came from the registry and a captured one cannot be replayed forever
+- Retry with backoff on server errors, no retry on a 4xx that will not improve
+- Delivery history per hook, so a webhook that is not arriving can be diagnosed
+  from the registry rather than from the receiver's logs
+
 **Management**
 
 - Web UI: repository browser, tag and layer inspection, image config and build
@@ -212,6 +222,10 @@ All configuration is by environment variable.
 | `REGISTRY_S3_SESSION_TOKEN` | — | For temporary credentials |
 | `REGISTRY_S3_PREFIX` | — | Key prefix, so one bucket can hold several registries |
 | `REGISTRY_S3_PATH_STYLE` | `true` | Path-style addressing; MinIO and most gateways need it |
+| `REGISTRY_WEBHOOKS` | `true` | Deliver events to registered endpoints |
+| `REGISTRY_WEBHOOK_WORKERS` | `2` | Concurrent deliveries |
+| `REGISTRY_WEBHOOK_QUEUE` | `512` | Backlog before events are dropped |
+| `REGISTRY_WEBHOOK_TIMEOUT` | `10s` | Per-attempt timeout |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -299,6 +313,10 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` `POST` | `/api/repositories/<name>/retention` | List / create retention rules |
 | `PATCH` `DELETE` | `/api/repositories/<name>/retention/<id>` | Enable / remove a rule |
 | `POST` | `/api/retention/preview` | Show what a sweep would delete *(admin)* |
+| `GET` `POST` | `/api/webhooks` | List / create webhooks *(admin)* |
+| `DELETE` | `/api/webhooks/<id>` | Remove a webhook *(admin)* |
+| `GET` | `/api/webhooks/<id>/deliveries` | Delivery history *(admin)* |
+| `POST` | `/api/webhooks/<id>/test` | Send a synthetic event *(admin)* |
 | `GET` | `/api/maintenance` | Scheduled-run history *(admin)* |
 | `POST` | `/api/maintenance/sweep` | Run retention and collection now *(admin)* |
 | `GET` | `/api/settings` | Effective configuration *(admin)* |
@@ -475,6 +493,40 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Webhooks
+
+```bash
+curl -u admin:PASSWORD -X POST http://localhost:5001/api/webhooks \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ci","url":"https://ci.example.com/hook",
+       "secret":"a-shared-secret","events":"push.tag,delete.tag"}'
+```
+
+Events: `push.tag`, `push.manifest`, `delete.tag`, `delete.manifest`,
+`scan.complete`, `retention.delete_tag`. Omit `events` or use `*` for all of
+them. Adding `"repository"` scopes the hook to one repository instead of the
+whole registry.
+
+Each delivery carries `X-Registry-Signature-256`, an HMAC-SHA256 over
+`"<timestamp>.<body>"` keyed with the secret. Verifying it:
+
+```python
+import hashlib, hmac
+ts = request.headers["X-Registry-Timestamp"]
+want = "sha256=" + hmac.new(SECRET, f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+hmac.compare_digest(want, request.headers["X-Registry-Signature-256"])
+```
+
+The timestamp is signed alongside the body so a captured delivery cannot be
+replayed indefinitely — reject one whose timestamp is far from now.
+
+Server errors are retried with exponential backoff; a 4xx other than 429 is not
+retried, because it will not improve and hammering a receiver that has rejected
+the request shape is pointless. Delivery never blocks the request that caused
+it: events are queued, and a saturated queue drops them and counts the drops.
 
 ---
 
