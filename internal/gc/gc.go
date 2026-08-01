@@ -102,36 +102,64 @@ func (c *Collector) Run(ctx context.Context, dryRun bool) (*Result, error) {
 	}
 	res.LinksPruned = len(pruned)
 
-	// Mark phase 2: everything still reachable from a live manifest.
-	reachable, err := c.DB.ReachableDigests(ctx)
+	// Mark phase 2: everything still reachable from a live manifest, grouped by
+	// the backend that stores it.
+	//
+	// Reachability cannot be global once blobs live in several backends. The
+	// same digest can be alive in one bucket and orphaned in another, and a
+	// single set would keep the orphan forever.
+	byRepo, err := c.DB.ReachableDigestsByRepo(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("compute reachable set: %w", err)
+	}
+	router := c.Store.Router()
+	reachableIn := map[string]map[string]struct{}{}
+	for repo, digests := range byRepo {
+		b, _ := router.Resolve(repo)
+		if b == nil {
+			// A repository whose rule names a missing backend: its blobs cannot
+			// be located, so nothing may be collected on its behalf.
+			return nil, fmt.Errorf("repository %q has no resolvable storage backend; "+
+				"fix its storage rule before collecting", repo)
+		}
+		set := reachableIn[b.Name()]
+		if set == nil {
+			set = map[string]struct{}{}
+			reachableIn[b.Name()] = set
+		}
+		for d := range digests {
+			set[d] = struct{}{}
+		}
 	}
 
 	cutoff := time.Now().Add(-c.Grace)
 
-	// Sweep: delete blobs on disk that nothing points at. Collect first so the
+	// Sweep each backend against its own reachable set. Collect first so the
 	// walk is not mutating the tree it is reading.
 	type victim struct {
-		digest string
-		size   int64
+		digest  string
+		size    int64
+		backend store.Backend
 	}
 	var victims []victim
-	err = c.Store.WalkBlobs(func(digest string, size int64) error {
-		res.BlobsScanned++
-		if _, ok := reachable[digest]; ok {
+	for name, backend := range c.Store.AllBackends() {
+		live := reachableIn[name]
+		err := store.WalkBlobsIn(ctx, backend, func(digest string, size int64, mtime time.Time) error {
+			res.BlobsScanned++
+			if _, ok := live[digest]; ok {
+				return nil
+			}
+			if mtime.After(cutoff) {
+				// Recently written: probably a push in flight.
+				res.BlobsSkipped++
+				return nil
+			}
+			victims = append(victims, victim{digest, size, backend})
 			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("walk blobs in %s: %w", name, err)
 		}
-		if _, mtime, err := c.Store.Stat(digest); err == nil && mtime.After(cutoff) {
-			// Recently written: probably a push in flight.
-			res.BlobsSkipped++
-			return nil
-		}
-		victims = append(victims, victim{digest, size})
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("walk blobs: %w", err)
 	}
 
 	for _, v := range victims {
@@ -149,7 +177,7 @@ func (c *Collector) Run(ctx context.Context, dryRun bool) (*Result, error) {
 		if dryRun {
 			continue
 		}
-		if err := c.Store.Delete(v.digest); err != nil {
+		if err := store.DeleteBlobIn(ctx, v.backend, v.digest); err != nil {
 			res.Errors = append(res.Errors, v.digest+": "+err.Error())
 			res.BlobsDeleted--
 			res.BytesReclaimed -= v.size

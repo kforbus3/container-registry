@@ -456,7 +456,7 @@ func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, name, ref s
 		s.ociErr(w, http.StatusNotFound, codeManifestUnknown, "manifest unknown", ref)
 		return
 	}
-	body, err := s.Store.ReadAll(digest)
+	body, err := s.Store.For(name).ReadAll(digest)
 	if err != nil {
 		s.ociErr(w, http.StatusNotFound, codeManifestUnknown, "manifest content missing", ref)
 		return
@@ -592,7 +592,7 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, name, ref s
 				s.ociErr(w, http.StatusInternalServerError, codeUnsupported, "failed to check blob", nil)
 				return
 			}
-			if !linked || !s.Store.Exists(ref.Digest) {
+			if !linked || !s.Store.For(name).Exists(ref.Digest) {
 				s.ociErr(w, http.StatusNotFound, codeManifestBlobUnknown,
 					"referenced blob is not present in this repository", ref.Digest)
 				return
@@ -600,7 +600,7 @@ func (s *Server) putManifest(w http.ResponseWriter, r *http.Request, name, ref s
 		}
 	}
 
-	if _, err := s.Store.PutBytesWith(algo, body); err != nil {
+	if _, err := s.Store.For(name).PutBytesWith(algo, body); err != nil {
 		s.ociErr(w, http.StatusInternalServerError, codeUnsupported, "failed to store manifest", nil)
 		return
 	}
@@ -761,7 +761,7 @@ func (s *Server) handleReferrers(w http.ResponseWriter, r *http.Request, name, d
 	for _, m := range manifests {
 		d := descriptor{MediaType: m.MediaType, Digest: m.Digest, Size: m.Size, ArtifactType: m.ArtifactType}
 		// Surface annotations so clients can filter without fetching each one.
-		if body, err := s.Store.ReadAll(m.Digest); err == nil {
+		if body, err := s.Store.For(name).ReadAll(m.Digest); err == nil {
 			var doc manifestDoc
 			if json.Unmarshal(body, &doc) == nil && len(doc.Annotations) > 0 {
 				d.Annotations = doc.Annotations
@@ -818,7 +818,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 		return
 
 	case http.MethodHead:
-		size, _, err := s.Store.Stat(digest)
+		size, _, err := s.Store.For(name).Stat(digest)
 		if err != nil {
 			s.ociErr(w, http.StatusNotFound, codeBlobUnknown, "blob content missing", digest)
 			return
@@ -830,7 +830,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 		return
 
 	case http.MethodGet:
-		size, _, err := s.Store.Stat(digest)
+		size, _, err := s.Store.For(name).Stat(digest)
 		if err != nil {
 			s.ociErr(w, http.StatusNotFound, codeBlobUnknown, "blob content missing", digest)
 			return
@@ -841,7 +841,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Etag", `"`+digest+`"`)
 		w.Header().Set("Accept-Ranges", "bytes")
-		s.serveBlobRange(w, r, digest, size)
+		s.serveBlobRange(w, r, name, digest, size)
 		return
 
 	default:
@@ -855,7 +855,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 // live in an object store, which returns a stream and not a seekable file.
 // Multi-range requests are answered in full, which the specification permits
 // and no registry client asks for.
-func (s *Server) serveBlobRange(w http.ResponseWriter, r *http.Request, digest string, size int64) {
+func (s *Server) serveBlobRange(w http.ResponseWriter, r *http.Request, name, digest string, size int64) {
 	start, end, ok, satisfiable := parseByteRange(r.Header.Get("Range"), size)
 	if !satisfiable {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
@@ -870,7 +870,7 @@ func (s *Server) serveBlobRange(w http.ResponseWriter, r *http.Request, digest s
 		if r.Method == http.MethodHead {
 			return
 		}
-		rc, err := s.Store.Open2(digest)
+		rc, err := s.Store.For(name).Open2(digest)
 		if err != nil {
 			return // headers are already sent; the truncated body signals failure
 		}
@@ -884,7 +884,7 @@ func (s *Server) serveBlobRange(w http.ResponseWriter, r *http.Request, digest s
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusPartialContent)
 
-	rc, err := s.Store.OpenRange(digest, start, length)
+	rc, err := s.Store.For(name).OpenRange(digest, start, length)
 	if err != nil {
 		return
 	}
@@ -1004,7 +1004,24 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request, name 
 // tryMount links an existing blob into the target repository. It reports
 // whether it produced a response.
 func (s *Server) tryMount(w http.ResponseWriter, r *http.Request, repo *db.Repository, name, digest, from string) bool {
-	if !store.ValidDigest(digest) || !s.Store.Exists(digest) {
+	if !store.ValidDigest(digest) {
+		return false
+	}
+	// Mounting links a blob into another repository without moving bytes, so
+	// it is only valid within one backend. Across a storage boundary the target
+	// would advertise a blob whose bytes are in a bucket it never reads -- a
+	// broken pull, and where the boundary is a jurisdiction, content escaping
+	// the region it was confined to. Declining falls back to a normal upload,
+	// which puts the bytes where they belong.
+	if from != "" && !s.Store.Router().SameBackend(from, name) {
+		return false
+	}
+	// Existence is checked where the bytes would actually come from.
+	source := name
+	if from != "" {
+		source = from
+	}
+	if !s.Store.For(source).Exists(digest) {
 		return false
 	}
 	p := principalFrom(r.Context())
@@ -1028,7 +1045,7 @@ func (s *Server) tryMount(w http.ResponseWriter, r *http.Request, repo *db.Repos
 
 	size, ok, err := s.DB.AnyBlobLink(r.Context(), digest)
 	if err != nil || !ok {
-		if fsSize, _, statErr := s.Store.Stat(digest); statErr == nil {
+		if fsSize, _, statErr := s.Store.For(source).Stat(digest); statErr == nil {
 			size = fsSize
 		} else {
 			return false
@@ -1148,11 +1165,17 @@ func (s *Server) completeUploadAt(w http.ResponseWriter, r *http.Request, repo *
 			return
 		}
 	}
-	size, err := s.Store.Commit(id, digest)
+	rs := s.Store.For(repo.Name)
+	size, err := rs.Commit(id, digest)
 	if err != nil {
 		s.uploadError(w, err, id)
 		return
 	}
+	// Record where the bytes actually went. When a rule is added later, the
+	// difference between this and what the rules now say is what tells an
+	// operator the repository needs migrating rather than leaving them to
+	// discover it from a 404.
+	s.DB.RecordRepoStorage(r.Context(), repo.ID, rs.BackendName())
 	// Enforce the quota after the bytes have landed but before the blob is
 	// linked, so an over-quota push is rejected without the repository being
 	// charged for it. The orphaned blob is reclaimed by garbage collection.

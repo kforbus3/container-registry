@@ -43,7 +43,7 @@ func TestMigrateCarriesBlobsAndSwaps(t *testing.T) {
 	want := map[string][]byte{}
 	for i := 0; i < 25; i++ {
 		body := []byte(fmt.Sprintf("blob number %d, with some content", i))
-		d, err := s.PutBytes(body)
+		d, err := s.For("test/repo").PutBytes(body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,7 +67,7 @@ func TestMigrateCarriesBlobsAndSwaps(t *testing.T) {
 
 	// Every blob must still read back, byte for byte, from the new backend.
 	for d, body := range want {
-		got, err := s.ReadAll(d)
+		got, err := s.For("test/repo").ReadAll(d)
 		if err != nil {
 			t.Fatalf("read %s after migration: %v", d, err)
 		}
@@ -86,7 +86,7 @@ func TestMigrateMirrorsConcurrentWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBytes([]byte("already here")); err != nil {
+	if _, err := s.For("test/repo").PutBytes([]byte("already here")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -99,7 +99,7 @@ func TestMigrateMirrorsConcurrentWrites(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	mid, err := s.PutBytes([]byte("pushed during the migration"))
+	mid, err := s.For("test/repo").PutBytes([]byte("pushed during the migration"))
 	if err != nil {
 		t.Fatalf("write during migration: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestMigrateMirrorsConcurrentWrites(t *testing.T) {
 	if st := waitMigration(t, s); st.Error != "" {
 		t.Fatalf("migration failed: %s", st.Error)
 	}
-	got, err := s.ReadAll(mid)
+	got, err := s.For("test/repo").ReadAll(mid)
 	if err != nil {
 		t.Fatalf("blob written during the migration was lost: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestMigrateVerifiesDigests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBytes([]byte("content that will be mangled")); err != nil {
+	if _, err := s.For("test/repo").PutBytes([]byte("content that will be mangled")); err != nil {
 		t.Fatal(err)
 	}
 	before := s.Backend()

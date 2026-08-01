@@ -953,6 +953,39 @@ func (d *DB) ReachableDigests(ctx context.Context) (map[string]struct{}, error) 
 	return out, rows.Err()
 }
 
+// ReachableDigestsByRepo returns every live digest paired with the repository
+// that keeps it alive.
+//
+// Collection needs this rather than a flat set once blobs can live in several
+// backends: a digest referenced by a repository in one bucket says nothing
+// about an identical orphan in another, and treating reachability as global
+// would keep that orphan forever.
+func (d *DB) ReachableDigestsByRepo(ctx context.Context) (map[string]map[string]struct{}, error) {
+	out := map[string]map[string]struct{}{}
+	rows, err := d.QueryContext(ctx, `
+		SELECT rep.name, m.digest FROM manifests m
+		  JOIN repositories rep ON rep.id = m.repo_id
+		UNION
+		SELECT rep.name, r.ref_digest FROM manifest_refs r
+		  JOIN manifests m ON m.id = r.manifest_id
+		  JOIN repositories rep ON rep.id = m.repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var repo, digest string
+		if err := rows.Scan(&repo, &digest); err != nil {
+			return nil, err
+		}
+		if out[repo] == nil {
+			out[repo] = map[string]struct{}{}
+		}
+		out[repo][digest] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // BlobLink identifies one repository's claim on a blob.
 type BlobLink struct {
 	Digest string

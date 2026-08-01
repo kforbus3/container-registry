@@ -9,7 +9,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -44,11 +43,15 @@ type Store struct {
 	root     string
 	maxBytes int64
 
-	// backend is where blobs live now; mirror is a second backend that writes
-	// are copied to while a migration is in flight. Both are atomic because
-	// the swap happens under live traffic.
+	// backend is the default backend: where blobs live when no storage rule
+	// claims their repository. mirror is a second backend that writes are
+	// copied to while a migration is in flight. Both are atomic because the
+	// swap happens under live traffic.
 	backend atomic.Pointer[backendRef]
 	mirror  atomic.Pointer[backendRef]
+
+	// router decides which backend a repository's blobs belong to.
+	router *Router
 
 	migration migration
 
@@ -78,6 +81,7 @@ func NewWithBackend(root string, maxBytes int64, backend Backend) (*Store, error
 	st := &Store{root: root, maxBytes: maxBytes, locks: map[string]*sync.Mutex{}}
 	st.backend.Store(&backendRef{b: backend})
 	st.mirror.Store(&backendRef{})
+	st.router = NewRouter(backend)
 	return st, nil
 }
 
@@ -85,6 +89,9 @@ func (s *Store) Root() string { return s.root }
 
 // Backend reports where blobs are stored, for logs and the settings endpoint.
 func (s *Store) Backend() string { return s.primary().Name() }
+
+// Router exposes the repository-to-backend routing table.
+func (s *Store) Router() *Router { return s.router }
 
 // blobKey is the backend key for a digest. The two-character fan-out keeps
 // filesystem directories manageable and gives object stores a well-distributed
@@ -172,130 +179,7 @@ func DigestAlgorithm(d string) string {
 	return algo
 }
 
-// BlobPath returns the on-disk path for a digest when blobs are stored
-// locally. It is meaningless for an object store and reports an error there.
-func (s *Store) BlobPath(digest string) (string, error) {
-	fs, ok := s.primary().(*FilesystemBackend)
-	if !ok {
-		return "", fmt.Errorf("blobs are not stored on the local filesystem")
-	}
-	key, err := blobKey(digest)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(fs.LocalRoot(), filepath.FromSlash(key)), nil
-}
-
 // ---------------------------------------------------------------- blob reads
-
-func (s *Store) Exists(digest string) bool {
-	key, err := blobKey(digest)
-	if err != nil {
-		return false
-	}
-	_, err = s.primary().Stat(context.Background(), key)
-	return err == nil
-}
-
-func (s *Store) Stat(digest string) (int64, time.Time, error) {
-	key, err := blobKey(digest)
-	if err != nil {
-		return 0, time.Time{}, err
-	}
-	info, err := s.primary().Stat(context.Background(), key)
-	if err != nil {
-		return 0, time.Time{}, err
-	}
-	return info.Size, info.Modified, nil
-}
-
-// Open returns a reader for a blob plus its size.
-func (s *Store) Open(digest string) (io.ReadCloser, int64, error) {
-	key, err := blobKey(digest)
-	if err != nil {
-		return nil, 0, err
-	}
-	info, err := s.primary().Stat(context.Background(), key)
-	if err != nil {
-		return nil, 0, err
-	}
-	rc, err := s.primary().Get(context.Background(), key)
-	if err != nil {
-		return nil, 0, err
-	}
-	return rc, info.Size, nil
-}
-
-// Open2 returns just a reader for a blob, for callers that already know the size.
-func (s *Store) Open2(digest string) (io.ReadCloser, error) {
-	key, err := blobKey(digest)
-	if err != nil {
-		return nil, err
-	}
-	return s.primary().Get(context.Background(), key)
-}
-
-// OpenRange returns a reader for part of a blob, which is what a ranged pull
-// needs. length <= 0 reads to the end.
-func (s *Store) OpenRange(digest string, offset, length int64) (io.ReadCloser, error) {
-	key, err := blobKey(digest)
-	if err != nil {
-		return nil, err
-	}
-	return s.primary().GetRange(context.Background(), key, offset, length)
-}
-
-// ReadAll loads a whole blob into memory. Only used for manifests, which are
-// bounded well under a megabyte.
-func (s *Store) ReadAll(digest string) ([]byte, error) {
-	key, err := blobKey(digest)
-	if err != nil {
-		return nil, err
-	}
-	rc, err := s.primary().Get(context.Background(), key)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	// Manifests and configs are the only things read whole, and both are
-	// bounded well under this.
-	return io.ReadAll(io.LimitReader(rc, 64<<20))
-}
-
-// PutBytes stores b under its own sha256 digest and returns that digest.
-func (s *Store) PutBytes(b []byte) (string, error) {
-	return s.PutBytesWith("sha256", b)
-}
-
-// PutBytesWith stores b under its digest in the named algorithm. Content
-// addressed under two algorithms is stored twice, which is the price of
-// letting a client choose how it names things.
-func (s *Store) PutBytesWith(algo string, b []byte) (string, error) {
-	digest, err := DigestWith(algo, b)
-	if err != nil {
-		return "", err
-	}
-	key, err := blobKey(digest)
-	if err != nil {
-		return "", err
-	}
-	if _, err := s.primary().Stat(context.Background(), key); err == nil {
-		return digest, nil // already present; content-addressed so identical
-	}
-	if err := s.putBoth(context.Background(), key, bytes.NewReader(b), int64(len(b))); err != nil {
-		return "", err
-	}
-	return digest, nil
-}
-
-// Delete removes a blob from the content store. Missing blobs are not an error.
-func (s *Store) Delete(digest string) error {
-	key, err := blobKey(digest)
-	if err != nil {
-		return err
-	}
-	return s.deleteBoth(context.Background(), key)
-}
 
 // ---------------------------------------------------------------- uploads
 
@@ -539,7 +423,7 @@ func (s *Store) Append(id string, r io.Reader, expectedOffset int64) (*Upload, e
 
 // Commit finalises an upload, verifying it hashes to expectedDigest, and moves
 // it into the content store. The session is removed either way.
-func (s *Store) Commit(id, expectedDigest string) (int64, error) {
+func (s *Store) commitTo(rs *RepoStore, id, expectedDigest string) (int64, error) {
 	mu := s.lockFor(id)
 	mu.Lock()
 	defer func() {
@@ -577,7 +461,11 @@ func (s *Store) Commit(id, expectedDigest string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := s.primary().Stat(context.Background(), key); err == nil {
+	backend, err := rs.Backend()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := backend.Stat(context.Background(), key); err == nil {
 		// Already present with identical content; drop the duplicate.
 		os.Remove(dataPath)
 		os.Remove(statePath)
@@ -588,7 +476,7 @@ func (s *Store) Commit(id, expectedDigest string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = s.putBoth(context.Background(), key, f, st.Offset)
+	err = s.putTo(context.Background(), backend, key, f, st.Offset)
 	f.Close()
 	if err != nil {
 		return 0, err

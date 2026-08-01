@@ -57,7 +57,7 @@ func (s *Server) cacheManifest(ctx context.Context, localRepo, upstreamRepo, ref
 	}
 
 	digest := store.Digest(body)
-	if _, err := s.Store.PutBytes(body); err != nil {
+	if _, err := s.Store.For(localRepo).PutBytes(body); err != nil {
 		return false, err
 	}
 	m := &db.Manifest{
@@ -89,8 +89,8 @@ func (s *Server) cacheBlob(ctx context.Context, repo *db.Repository, upstreamRep
 	}
 	// The content store is shared, so a blob already present from another
 	// repository only needs linking rather than downloading again.
-	if s.Store.Exists(digest) {
-		size, _, err := s.Store.Stat(digest)
+	if s.Store.For(repo.Name).Exists(digest) {
+		size, _, err := s.Store.For(repo.Name).Stat(digest)
 		if err == nil {
 			return s.DB.LinkBlob(ctx, repo.ID, digest, size)
 		}
@@ -112,7 +112,7 @@ func (s *Server) cacheBlob(ctx context.Context, repo *db.Repository, upstreamRep
 		s.Store.Cancel(up.ID)
 		return err
 	}
-	size, err := s.Store.Commit(up.ID, digest)
+	size, err := s.Store.For(repo.Name).Commit(up.ID, digest)
 	if err != nil {
 		return fmt.Errorf("upstream blob %s failed verification: %w", digest, err)
 	}

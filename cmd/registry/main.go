@@ -73,6 +73,11 @@ func run() error {
 	collector.UploadTTL = cfg.GCUploadTTL
 
 	srv := api.NewServer(cfg, database, st, log)
+	// Storage routing lives in the database, so the in-memory table has to be
+	// built before the first request rather than on demand.
+	if err := srv.LoadRouting(context.Background()); err != nil {
+		return fmt.Errorf("load storage routing: %w", err)
+	}
 	srv.SetCollector(collector)
 	if cfg.ProxyRemote != "" {
 		srv.SetUpstream(proxy.NewUpstream(

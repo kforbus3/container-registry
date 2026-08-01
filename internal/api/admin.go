@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -67,6 +66,13 @@ func (s *Server) adminRouter() http.Handler {
 	mux.Handle("POST /storage/check", s.requireAdmin(s.handleStorageCheck))
 	mux.Handle("PUT /storage", s.requireAdmin(s.handleStorageSave))
 	mux.Handle("POST /storage/migrate", s.requireAdmin(s.handleStorageMigrate))
+	mux.Handle("GET /storage/backends", s.requireAdmin(s.handleStorageBackends))
+	mux.Handle("POST /storage/backends", s.requireAdmin(s.handleStorageBackends))
+	mux.Handle("DELETE /storage/backends/{name}", s.requireAdmin(s.handleStorageBackend))
+	mux.Handle("GET /storage/rules", s.requireAdmin(s.handleStorageRules))
+	mux.Handle("POST /storage/rules", s.requireAdmin(s.handleStorageRules))
+	mux.Handle("DELETE /storage/rules/{id}", s.requireAdmin(s.handleStorageRule))
+	mux.Handle("PATCH /storage/rules/{id}", s.requireAdmin(s.handleStorageRule))
 	mux.Handle("GET /storage/migrate", s.requireAdmin(s.handleStorageMigrate))
 
 	mux.Handle("GET /webhooks", s.requireAdmin(s.handleWebhookList))
@@ -1108,44 +1114,26 @@ func maskKey(k string) string {
 // writable, which is the question an operator has after configuring one:
 // credentials and bucket policies fail at the first push otherwise.
 func (s *Server) handleStorageCheck(w http.ResponseWriter, r *http.Request) {
-	probe := []byte("registry storage check")
-	started := time.Now()
-
-	digest, err := s.Store.PutBytes(probe)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": "write", "error": err.Error(),
-			"backend": s.Store.Backend(),
-		})
-		return
+	// Which backend to prove: a named one when asked for, otherwise the
+	// default. Checking "the" store stopped being meaningful once a registry
+	// could have several.
+	target := r.URL.Query().Get("backend")
+	backend := s.Store.Router().Fallback()
+	if target != "" {
+		b, ok := s.Store.Router().Backends()[target]
+		if !ok {
+			writeErr(w, http.StatusNotFound, "no storage backend named "+target)
+			return
+		}
+		backend = b
 	}
-	got, err := s.Store.ReadAll(digest)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": "read", "error": err.Error(),
-			"backend": s.Store.Backend(),
-		})
-		return
-	}
-	if !bytes.Equal(got, probe) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "stage": "verify",
-			"error":   "the object read back does not match what was written",
-			"backend": s.Store.Backend(),
-		})
-		return
-	}
-	// The probe is content-addressed like anything else, so leaving it would be
-	// harmless, but removing it also exercises delete.
-	deleteErr := ""
-	if err := s.Store.Delete(digest); err != nil {
-		deleteErr = err.Error()
-	}
+	res := probeBackend(r.Context(), backend)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":           true,
-		"backend":      s.Store.Backend(),
-		"latency_ms":   time.Since(started).Milliseconds(),
-		"delete_error": deleteErr,
+		"ok":         res.OK,
+		"stage":      res.Stage,
+		"error":      res.Error,
+		"backend":    backend.Name(),
+		"latency_ms": res.Latency.Milliseconds(),
 	})
 }
 
@@ -1159,6 +1147,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"max_upload_bytes":     s.Cfg.MaxUploadBytes,
 		"session_ttl":          s.Cfg.SessionTTL.String(),
 		"storage":              s.storageView(),
+		"routing":              s.routingView(r.Context()),
 		"gc_grace":             s.collector.Grace.String(),
 		"gc_upload_ttl":        s.collector.UploadTTL.String(),
 		"maintenance_interval": s.Cfg.MaintenanceInterval.String(),
@@ -1552,7 +1541,7 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 	tags, _ := s.DB.TagsForDigest(r.Context(), repo.ID, digest)
 
 	resp := map[string]any{"manifest": m, "refs": refs, "tags": tags}
-	if body, err := s.Store.ReadAll(digest); err == nil {
+	if body, err := s.Store.For(repo.Name).ReadAll(digest); err == nil {
 		var raw any
 		if json.Unmarshal(body, &raw) == nil {
 			resp["content"] = raw
@@ -1560,7 +1549,7 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 	}
 	// Decode the image config so the UI can show entrypoint, env and history.
 	if m.ConfigDigest != "" {
-		if cfgBody, err := s.Store.ReadAll(m.ConfigDigest); err == nil && len(cfgBody) < (2<<20) {
+		if cfgBody, err := s.Store.For(repo.Name).ReadAll(m.ConfigDigest); err == nil && len(cfgBody) < (2<<20) {
 			var cfg imageConfig
 			if json.Unmarshal(cfgBody, &cfg) == nil {
 				resp["config"] = cfg
@@ -1585,7 +1574,7 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 		if found[0].Platform != "" {
 			summary["platform"] = found[0].Platform
 		}
-		if body, err := s.Store.ReadAll(found[0].ArtifactDigest); err == nil {
+		if body, err := s.Store.For(repo.Name).ReadAll(found[0].ArtifactDigest); err == nil {
 			var art struct {
 				Annotations map[string]string `json:"annotations"`
 			}
@@ -1631,7 +1620,7 @@ func (s *Server) findSBOMs(ctx context.Context, repo *db.Repository, digest stri
 	if err != nil || !isIndexType(m.MediaType) {
 		return nil, nil
 	}
-	body, err := s.Store.ReadAll(digest)
+	body, err := s.Store.For(repo.Name).ReadAll(digest)
 	if err != nil {
 		return nil, nil
 	}
@@ -1731,7 +1720,7 @@ func (s *Server) repoSBOM(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		w.Header().Set("X-Registry-Sbom-Platform", found[0].Platform)
 	}
 	// The artifact manifest carries the document as its single layer.
-	artBody, err := s.Store.ReadAll(found[0].ArtifactDigest)
+	artBody, err := s.Store.For(repo.Name).ReadAll(found[0].ArtifactDigest)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "SBOM artifact is missing from storage")
 		return
@@ -1745,7 +1734,7 @@ func (s *Server) repoSBOM(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		writeErr(w, http.StatusInternalServerError, "malformed SBOM artifact")
 		return
 	}
-	doc, err := s.Store.ReadAll(art.Layers[0].Digest)
+	doc, err := s.Store.For(repo.Name).ReadAll(art.Layers[0].Digest)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "SBOM document is missing from storage")
 		return
