@@ -717,15 +717,33 @@ Upload scratch space stays on local disk even when blobs do not. An in-progress
 upload is appended to and re-read constantly, and object stores charge per
 request.
 
-The **Maintenance** page shows which backend is in effect — endpoint, bucket,
-region, key prefix, addressing style and a masked access key — with a *Test
-connection* button that writes, reads back and deletes a probe object, so a
-misconfigured bucket or a wrong key is visible immediately rather than at the
-next push. The secret key is never returned by the API.
+### Configuring it from the UI
 
-Storage is deliberately not editable from the UI. It is chosen at start-up, and
-switching backends on a running registry would strand every blob already written
-to the old one; change the environment and restart instead.
+The **Maintenance** page shows which backend is in effect — endpoint, bucket,
+region, key prefix, addressing style and a masked access key — and can change
+it. The settings are proved against the real backend before being saved (a
+write, a read back and a delete), so a wrong bucket or an expired key fails at
+the form rather than at the next push. The secret key is never returned by the
+API.
+
+Saving does not move anything, because blobs do not move themselves: until they
+are copied, a new backend would answer 404 for every image the registry already
+had. So the switch is an explicit **migration** that copies every blob, verifies
+each one by reading it back and comparing against the digest its key encodes,
+and only then starts serving from the new backend. Pushes keep working
+throughout — writes go to both backends until the copy finishes, so nothing
+pushed mid-migration is lost at the switch. A failed or interrupted migration
+changes nothing: blobs are content-addressed, so a retry resumes rather than
+starting over. The old backend keeps its copy until you remove it.
+
+`REGISTRY_S3_*` in the environment still wins. A value set in a unit file is
+what its author expects to be in force, so when those variables are present the
+UI shows the configuration read-only and refuses to override it. Only when the
+environment is silent does the saved configuration apply.
+
+The secret key is encrypted with AES-GCM under a key in `config.key`, written
+0600 beside the database rather than inside it — a stolen database file alone
+does not yield the object-store credential.
 
 **Verified against MinIO**: the full OCI conformance suite passes with blobs in
 object storage — 986 assertions, zero failures — as do byte-range reads,
