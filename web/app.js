@@ -239,7 +239,7 @@ const CLIENTS = {
   docker: {
     name: 'Docker',
     login: (h, u) => `echo "$REGISTRY_TOKEN" | docker login ${h} -u ${u} --password-stdin`,
-    push: (h) => `docker login ${h}
+    push: (h, u) => `docker login ${h} -u ${u}
 docker tag myapp:latest ${h}/myapp:latest
 docker push ${h}/myapp:latest`,
     pull: (h, ref) => `docker pull ${h}/${ref}`,
@@ -251,7 +251,7 @@ docker push ${h}/myapp:latest`,
   podman: {
     name: 'Podman',
     login: (h, u) => `echo "$REGISTRY_TOKEN" | podman login ${h} -u ${u} --password-stdin`,
-    push: (h) => `podman login ${h}
+    push: (h, u) => `podman login ${h} -u ${u}
 podman tag myapp:latest ${h}/myapp:latest
 podman push ${h}/myapp:latest`,
     pull: (h, ref) => `podman pull ${h}/${ref}`,
@@ -261,7 +261,9 @@ podman push ${h}/myapp:latest`,
   skopeo: {
     name: 'skopeo',
     login: (h, u) => `echo "$REGISTRY_TOKEN" | skopeo login ${h} -u ${u} --password-stdin`,
-    push: (h) => `# copy straight from the local daemon, no tag dance
+    push: (h, u) => `skopeo login ${h} -u ${u}
+
+# copy straight from the local daemon, no tag dance
 skopeo copy docker-daemon:myapp:latest docker://${h}/myapp:latest`,
     pull: (h, ref) => `skopeo copy docker://${h}/${ref} docker-daemon:${ref}
 
@@ -274,7 +276,9 @@ skopeo inspect docker://${h}/${ref}`,
   crane: {
     name: 'crane',
     login: (h, u) => `crane auth login ${h} -u ${u} -p "$REGISTRY_TOKEN"`,
-    push: (h) => `# push a tarball, or copy an image between registries
+    push: (h, u) => `crane auth login ${h} -u ${u}
+
+# push a tarball, or copy an image between registries
 crane push myapp.tar ${h}/myapp:latest
 crane copy alpine:3.20 ${h}/alpine:3.20`,
     pull: (h, ref) => `crane pull ${h}/${ref} myapp.tar
@@ -286,7 +290,9 @@ crane digest ${h}/${ref}`,
   oras: {
     name: 'ORAS',
     login: (h, u) => `echo "$REGISTRY_TOKEN" | oras login ${h} -u ${u} --password-stdin`,
-    push: (h) => `# any file is a valid OCI artifact, not just images
+    push: (h, u) => `oras login ${h} -u ${u}
+
+# any file is a valid OCI artifact, not just images
 oras push ${h}/myartifact:v1 ./report.json:application/json`,
     pull: (h, ref) => `oras pull ${h}/${ref}
 
@@ -297,7 +303,9 @@ oras discover ${h}/${ref}`,
   helm: {
     name: 'Helm',
     login: (h, u) => `echo "$REGISTRY_TOKEN" | helm registry login ${h} -u ${u} --password-stdin`,
-    push: (h) => `helm package mychart
+    push: (h, u) => `helm registry login ${h} -u ${u}
+
+helm package mychart
 helm push mychart-0.1.0.tgz oci://${h}/charts`,
     pull: (h, ref, tag) => `helm pull oci://${h}/${ref.split(':')[0]} --version ${tag}`,
     insecure: 'Pass <code>--plain-http</code> to <strong>both</strong> '
@@ -456,7 +464,7 @@ async function renderOverview(view) {
 
     <div class="card">
       <h2>Push your first image</h2>
-      ${clientTabs('push', IMAGE_CLIENTS, (c) => c.push(host))}
+      ${clientTabs('push', IMAGE_CLIENTS, (c) => c.push(host, state.me.username))}
       <p class="muted small" style="margin-top:.7rem">
         Sign in with your username and either your password or an API token as the password.
         This registry implements the OCI distribution specification, so any conformant
@@ -648,6 +656,11 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
       <h2>Pull this ${isChart ? 'chart' : 'image'}</h2>
       ${clientTabs('pull', isChart ? HELM_CLIENTS : IMAGE_CLIENTS,
         (c) => c.pull(host, `${repo.name}:${pullTag}`, pullTag))}
+      ${repo.public ? `<p class="muted small" style="margin-top:.7rem">This repository is
+        public, so pulling needs no credentials.</p>`
+      : `<p class="muted small" style="margin-top:.7rem">This repository is private:
+        log in first with the same client — the
+        <a href="#/tokens">API Tokens</a> page shows the command for each.</p>`}
     </div>`;
 
   bindTagSearch(repo.name);
