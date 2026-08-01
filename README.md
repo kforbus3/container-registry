@@ -221,7 +221,7 @@ All configuration is by environment variable.
 | `REGISTRY_VULN_WORKERS` | `2` | Concurrent scans |
 | `REGISTRY_VULN_QUEUE` | `256` | Backlog depth before scans are dropped |
 | `REGISTRY_VULN_TIMEOUT` | `60s` | Per-request timeout to the advisory service |
-| `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused |
+| `REGISTRY_VULN_ADVISORY_TTL` | `24h` | How long a cached advisory is reused, and how long an unreferenced one is kept |
 | `REGISTRY_MAINTENANCE_INTERVAL` | `6h` | How often retention and collection run; `0` disables |
 | `REGISTRY_MAINTENANCE_DELAY` | `5m` | Delay before the first scheduled sweep |
 | `REGISTRY_RATE_LIMIT` | `0` | Requests per minute per caller; `0` disables |
@@ -244,7 +244,7 @@ All configuration is by environment variable.
 | `REGISTRY_PROXY_USERNAME` / `REGISTRY_PROXY_PASSWORD` | — | Upstream credentials; anonymous pulls have far lower limits |
 | `REGISTRY_PROXY_TIMEOUT` | `120s` | Upstream request timeout |
 | `REGISTRY_TOKEN_AUTH` | `false` | Offer the Docker bearer-token scheme alongside Basic |
-| `REGISTRY_TOKEN_REALM` | `/token` | Absolute URL clients fetch tokens from |
+| `REGISTRY_TOKEN_REALM` | *(derived from the request)* | Absolute URL clients fetch tokens from; set this when behind a proxy that does not send `X-Forwarded-*` |
 | `REGISTRY_TOKEN_SECRET` | *(generated)* | Signs issued tokens; required if running more than one instance |
 | `REGISTRY_TOKEN_TTL` | `5m` | How long an issued token stays valid |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -312,6 +312,7 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` | `/api/auth/me` | Current principal and its permissions |
 | `POST` | `/api/auth/password` | Change your own password |
 | `GET` | `/api/stats` | Counts and storage usage |
+| `POST` | `/api/storage/check` | Write, read back and delete a probe object; confirms the blob store is reachable and writable (admin) |
 | `GET` | `/api/repositories` | Repositories visible to the caller |
 | `GET` | `/api/repositories/<name>` | Tags, manifests and untagged manifests |
 | `PATCH` | `/api/repositories/<name>` | Set public / immutable / description |
@@ -528,9 +529,16 @@ registry speaks:
 
 ```bash
 REGISTRY_TOKEN_AUTH=true
-REGISTRY_TOKEN_REALM=https://registry.example.com/token
 REGISTRY_TOKEN_SECRET=...    # required if you run more than one instance
+REGISTRY_TOKEN_REALM=https://registry.example.com/token   # optional; see below
 ```
+
+The realm must be an **absolute URL** — clients reject a bare path outright
+rather than resolving it against the registry. Since the registry does not know
+its own public address, an unset realm is derived per request from the `Host`
+header, honouring `X-Forwarded-Proto` and `X-Forwarded-Host`. That is correct
+for direct access and for a normal reverse proxy; set the variable explicitly
+for anything else.
 
 A client is challenged with the token service and the scope it is attempting,
 fetches a token for that scope, and retries:
@@ -698,6 +706,16 @@ verifies the digest itself regardless.
 Upload scratch space stays on local disk even when blobs do not. An in-progress
 upload is appended to and re-read constantly, and object stores charge per
 request.
+
+The **Maintenance** page shows which backend is in effect — endpoint, bucket,
+region, key prefix, addressing style and a masked access key — with a *Test
+connection* button that writes, reads back and deletes a probe object, so a
+misconfigured bucket or a wrong key is visible immediately rather than at the
+next push. The secret key is never returned by the API.
+
+Storage is deliberately not editable from the UI. It is chosen at start-up, and
+switching backends on a running registry would strand every blob already written
+to the old one; change the environment and restart instead.
 
 **Verified against MinIO**: the full OCI conformance suite passes with blobs in
 object storage — 986 assertions, zero failures — as do byte-range reads,

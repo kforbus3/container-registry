@@ -177,6 +177,9 @@ type CachedAdvisory struct {
 	CVSS      float64
 	Modified  string
 	FetchedAt time.Time
+	// Document is the advisory as the upstream database returned it. The
+	// scanner needs the affected ranges, which no summary column can hold.
+	Document []byte
 }
 
 // GetAdvisories loads cached advisories by identifier. Entries older than maxAge
@@ -193,7 +196,7 @@ func (d *DB) GetAdvisories(ctx context.Context, ids []string, maxAge time.Durati
 		args[i] = id
 	}
 	rows, err := d.QueryContext(ctx,
-		`SELECT id, aliases, summary, severity, cvss, modified, fetched_at
+		`SELECT id, aliases, summary, severity, cvss, modified, fetched_at, document
 		 FROM vuln_advisories WHERE id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, err
@@ -203,11 +206,12 @@ func (d *DB) GetAdvisories(ctx context.Context, ids []string, maxAge time.Durati
 	cutoff := time.Now().Add(-maxAge)
 	for rows.Next() {
 		var a CachedAdvisory
-		var aliases, fetched string
+		var aliases, fetched, document string
 		if err := rows.Scan(&a.ID, &aliases, &a.Summary, &a.Severity, &a.CVSS,
-			&a.Modified, &fetched); err != nil {
+			&a.Modified, &fetched, &document); err != nil {
 			return nil, err
 		}
+		a.Document = []byte(document)
 		a.FetchedAt = parseTS(fetched)
 		if maxAge > 0 && a.FetchedAt.Before(cutoff) {
 			continue
@@ -222,15 +226,39 @@ func (d *DB) GetAdvisories(ctx context.Context, ids []string, maxAge time.Durati
 
 func (d *DB) PutAdvisory(ctx context.Context, a *CachedAdvisory) error {
 	_, err := d.ExecContext(ctx, `INSERT INTO vuln_advisories
-		(id, aliases, summary, severity, cvss, modified, fetched_at)
-		VALUES (?,?,?,?,?,?,?)
+		(id, aliases, summary, severity, cvss, modified, fetched_at, document)
+		VALUES (?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			aliases = excluded.aliases, summary = excluded.summary,
 			severity = excluded.severity, cvss = excluded.cvss,
-			modified = excluded.modified, fetched_at = excluded.fetched_at`,
+			modified = excluded.modified, fetched_at = excluded.fetched_at,
+			document = excluded.document`,
 		a.ID, strings.Join(a.Aliases, ","), a.Summary, a.Severity, a.CVSS,
-		a.Modified, nowStr())
+		a.Modified, nowStr(), string(a.Document))
 	return err
+}
+
+// PruneAdvisories drops cached advisories that no finding refers to and that
+// are older than maxAge.
+//
+// The cache holds each advisory's full document, which is what lets a re-scan
+// agree with the scan that ran on push -- but it is several kilobytes per
+// record, and without this the table would only ever grow. An advisory still
+// referenced by a finding is kept however old it is, since the detail is shown
+// alongside that finding.
+func (d *DB) PruneAdvisories(ctx context.Context, maxAge time.Duration) (int64, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-maxAge).UTC().Format(time.RFC3339Nano)
+	res, err := d.ExecContext(ctx,
+		`DELETE FROM vuln_advisories
+		 WHERE fetched_at < ?
+		   AND id NOT IN (SELECT vuln_id FROM vuln_findings)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // VulnStats aggregates findings across the whole registry for the dashboard.

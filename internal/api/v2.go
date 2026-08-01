@@ -134,11 +134,11 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrDisabled):
-			s.challengeScoped(w, "account is disabled", want)
+			s.challengeScoped(w, r, "account is disabled", want)
 		case errors.Is(err, auth.ErrTokenInactive):
-			s.challengeScoped(w, "token is revoked or expired", want)
+			s.challengeScoped(w, r, "token is revoked or expired", want)
 		default:
-			s.challengeScoped(w, "authentication required", want)
+			s.challengeScoped(w, r, "authentication required", want)
 		}
 		return
 	}
@@ -149,7 +149,7 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 		if act == actionPull && s.Cfg.AllowAnonymousPull && s.repoIsPublic(r, repo) {
 			p = auth.Anonymous()
 		} else {
-			s.challengeScoped(w, "authentication required", want)
+			s.challengeScoped(w, r, "authentication required", want)
 			return
 		}
 	}
@@ -174,7 +174,7 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 	}
 	if !allowed {
 		if p.IsAnonymous() {
-			s.challengeScoped(w, "authentication required", want)
+			s.challengeScoped(w, r, "authentication required", want)
 			return
 		}
 		// A bearer token that simply does not carry this scope is answered with
@@ -182,7 +182,7 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 		// does. That is how the token flow is meant to escalate; a flat 403
 		// would strand a client holding a token for a different repository.
 		if p.Scopes != nil {
-			s.challengeScoped(w, "token does not grant "+want, want)
+			s.challengeScoped(w, r, "token does not grant "+want, want)
 			return
 		}
 		s.ociErr(w, http.StatusForbidden, codeDenied,
@@ -266,12 +266,12 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := s.resolvePrincipal(r)
 	if err != nil {
-		s.challenge(w, "invalid credentials")
+		s.challenge(w, r, "invalid credentials")
 		return
 	}
 	if p == nil && !s.Cfg.AllowAnonymousPull {
 		// A 401 with a Basic challenge is what drives `docker login`.
-		s.challenge(w, "authentication required")
+		s.challenge(w, r, "authentication required")
 		return
 	}
 	// This endpoint resolves its own principal rather than going through the
@@ -291,7 +291,7 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	p, err := s.resolvePrincipal(r)
 	if err != nil || (p == nil && !s.Cfg.AllowAnonymousPull) {
-		s.challenge(w, "authentication required")
+		s.challenge(w, r, "authentication required")
 		return
 	}
 	if p == nil {

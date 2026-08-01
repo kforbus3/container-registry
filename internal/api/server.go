@@ -185,8 +185,8 @@ func (s *Server) ociErr(w http.ResponseWriter, status int, code, message string,
 
 // challenge sends a 401 with a Basic auth challenge, which is what makes
 // `docker login` prompt for and then send credentials.
-func (s *Server) challenge(w http.ResponseWriter, message string) {
-	s.challengeScoped(w, message, "")
+func (s *Server) challenge(w http.ResponseWriter, r *http.Request, message string) {
+	s.challengeScoped(w, r, message, "")
 }
 
 // challengeScoped sends the 401 that drives a client to authenticate.
@@ -194,13 +194,9 @@ func (s *Server) challenge(w http.ResponseWriter, message string) {
 // With token auth enabled the challenge names this registry's own token
 // service and the scope being attempted, which is what a token-flow client
 // needs to fetch a credential for exactly the operation it is retrying.
-func (s *Server) challengeScoped(w http.ResponseWriter, message, scope string) {
+func (s *Server) challengeScoped(w http.ResponseWriter, r *http.Request, message, scope string) {
 	if s.Cfg.TokenAuth {
-		realm := strings.TrimRight(s.Cfg.TokenRealm, "/")
-		if realm == "" {
-			realm = "/token"
-		}
-		challenge := fmt.Sprintf(`Bearer realm=%q,service=%q`, realm, s.Cfg.Realm)
+		challenge := fmt.Sprintf(`Bearer realm=%q,service=%q`, s.tokenRealm(r), s.Cfg.Realm)
 		if scope != "" {
 			challenge += fmt.Sprintf(`,scope=%q`, scope)
 		}
@@ -209,6 +205,46 @@ func (s *Server) challengeScoped(w http.ResponseWriter, message, scope string) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+s.Cfg.Realm+`"`)
 	}
 	s.ociErr(w, http.StatusUnauthorized, codeUnauthorized, message, nil)
+}
+
+// tokenRealm returns the absolute URL of the token service.
+//
+// The realm must be absolute: it is a URL the client fetches directly, and
+// clients reject a bare path outright rather than resolving it. Since the
+// registry does not know its own public address, an unconfigured realm is
+// derived from the request -- which is right for direct access and for a proxy
+// that sets the usual forwarding headers. Set REGISTRY_TOKEN_REALM explicitly
+// for anything else.
+func (s *Server) tokenRealm(r *http.Request) string {
+	realm := strings.TrimRight(s.Cfg.TokenRealm, "/")
+	if strings.Contains(realm, "://") {
+		return realm
+	}
+	if realm == "" {
+		realm = "/token"
+	}
+	if !strings.HasPrefix(realm, "/") {
+		realm = "/" + realm
+	}
+	if r == nil {
+		return realm
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		// Only the first value: a chain of proxies appends to this header.
+		scheme = strings.TrimSpace(strings.Split(p, ",")[0])
+	}
+	host := r.Host
+	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+		host = strings.TrimSpace(strings.Split(h, ",")[0])
+	}
+	if host == "" {
+		return realm
+	}
+	return scheme + "://" + host + realm
 }
 
 // ---------------------------------------------------------------- JSON helpers

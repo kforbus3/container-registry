@@ -31,6 +31,12 @@ if [ ! -x "$BIN" ]; then
   (cd "$CACHE/distribution-spec/conformance" && go test -c -o "$BIN" .)
 fi
 
+# Build from the current tree. Running a stale -- or missing -- binary is worse
+# than not running at all: the suite reports around a thousand failures that say
+# nothing about the code under test.
+echo "==> building the registry"
+(cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o bin/registry ./cmd/registry)
+
 echo "==> starting registry on :$PORT"
 REGISTRY_ADDR=":$PORT" \
 REGISTRY_DATA_DIR="$DATA" \
@@ -40,10 +46,16 @@ REGISTRY_LOG_LEVEL=error \
 REGISTRY_PID=$!
 trap 'kill $REGISTRY_PID 2>/dev/null || true; rm -rf "$DATA"' EXIT
 
+up=""
 for _ in $(seq 1 40); do
-  curl -sf "http://localhost:$PORT/healthz" >/dev/null && break
+  if curl -sf "http://localhost:$PORT/healthz" >/dev/null; then up=yes; break; fi
   sleep 0.25
 done
+if [ -z "$up" ]; then
+  echo "the registry did not come up on :$PORT; its log follows" >&2
+  cat "$DATA/registry.log" >&2
+  exit 1
+fi
 
 echo "==> running conformance suite"
 cd "$DATA"

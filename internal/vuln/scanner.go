@@ -240,7 +240,7 @@ func (s *Scanner) Scan(ctx context.Context, job Job) (*db.VulnScan, error) {
 			needed[id] = true
 		}
 	}
-	advisories, err := s.advisories(ctx, needed, matchesNeedingRanges(queried, matches))
+	advisories, err := s.advisories(ctx, needed)
 	if err != nil {
 		return nil, err
 	}
@@ -317,21 +317,6 @@ func (s *Scanner) Scan(ctx context.Context, job Job) (*db.VulnScan, error) {
 	return scan, nil
 }
 
-// matchesNeedingRanges lists the advisories whose full record is required
-// because the ecosystem they came from needs a range check.
-func matchesNeedingRanges(queried []component, matches [][]string) map[string]bool {
-	out := map[string]bool{}
-	for i, ids := range matches {
-		if i >= len(queried) || !needsRangeCheck(queried[i].query.Ecosystem) {
-			continue
-		}
-		for _, id := range ids {
-			out[id] = true
-		}
-	}
-	return out
-}
-
 // purlNamespace pulls the distro namespace back out of a package URL.
 func purlNamespace(purl string) string {
 	p, ok := parsePURL(purl)
@@ -341,22 +326,32 @@ func purlNamespace(purl string) string {
 	return p.Namespace
 }
 
-// resolvedAdvisory is a cached advisory plus the fix version, which is not
-// cached because it is specific to the affected package range.
+// resolvedAdvisory is an advisory with its detail resolved, however it was
+// obtained. Fixed and Full are always derived from the advisory document, so a
+// cache hit and a fresh fetch produce the same finding -- which is what makes a
+// re-scan agree with the scan that ran on push.
 type resolvedAdvisory struct {
 	Severity string
 	CVSS     float64
 	Summary  string
 	Aliases  []string
 	Fixed    string
-	// Full is populated only for advisories that need their affected ranges
-	// checked, since holding every record would be wasteful.
-	Full *Advisory
+	Full     *Advisory
+}
+
+// resolve derives the parts of a finding that live in the advisory document.
+func resolve(a *Advisory) resolvedAdvisory {
+	severity, score := a.Rating()
+	return resolvedAdvisory{
+		Severity: severity, CVSS: score,
+		Summary: a.Summary, Aliases: a.Aliases,
+		Fixed: a.FixedVersion(), Full: a,
+	}
 }
 
 // advisories resolves detail for each identifier, using the shared cache and
 // fetching only what is missing or stale.
-func (s *Scanner) advisories(ctx context.Context, ids map[string]bool, needFull map[string]bool) (map[string]resolvedAdvisory, error) {
+func (s *Scanner) advisories(ctx context.Context, ids map[string]bool) (map[string]resolvedAdvisory, error) {
 	list := make([]string, 0, len(ids))
 	for id := range ids {
 		list = append(list, id)
@@ -368,38 +363,33 @@ func (s *Scanner) advisories(ctx context.Context, ids map[string]bool, needFull 
 		return nil, err
 	}
 	for id, a := range cached {
-		if needFull[id] {
-			continue // the cache holds no ranges, so this one must be fetched
+		// Entries written before the document was cached are treated as misses
+		// rather than as advisories with no ranges, which would understate the
+		// finding as unfixable.
+		full, ok := ParseAdvisory(a.Document)
+		if !ok {
+			continue
 		}
-		out[id] = resolvedAdvisory{
-			Severity: a.Severity, CVSS: a.CVSS,
-			Summary: a.Summary, Aliases: a.Aliases,
-		}
+		out[id] = resolve(full)
 	}
 
 	for _, id := range list {
 		if _, ok := out[id]; ok {
 			continue
 		}
-		a, err := s.Client.Advisory(ctx, id)
+		a, raw, err := s.Client.Advisory(ctx, id)
 		if err != nil {
 			// One unavailable advisory should not sink the whole scan; the
 			// finding is still reported, with an unknown severity.
 			s.Log.Warn("could not fetch advisory", "id", id, "err", err)
 			continue
 		}
-		severity, score := a.Rating()
-		resolved := resolvedAdvisory{
-			Severity: severity, CVSS: score,
-			Summary: a.Summary, Aliases: a.Aliases, Fixed: a.FixedVersion(),
-		}
-		if needFull[id] {
-			resolved.Full = a
-		}
+		resolved := resolve(a)
 		out[id] = resolved
 		if err := s.DB.PutAdvisory(ctx, &db.CachedAdvisory{
 			ID: a.ID, Aliases: a.Aliases, Summary: a.Summary,
-			Severity: severity, CVSS: score, Modified: a.Modified,
+			Severity: resolved.Severity, CVSS: resolved.CVSS,
+			Modified: a.Modified, Document: raw,
 		}); err != nil {
 			return nil, err
 		}

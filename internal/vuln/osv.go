@@ -176,12 +176,29 @@ func (c *Client) QueryBatch(ctx context.Context, queries []Query) ([][]string, e
 }
 
 // Advisory fetches the full record for one vulnerability identifier.
-func (c *Client) Advisory(ctx context.Context, id string) (*Advisory, error) {
+// Advisory fetches one advisory, returning both the parsed record and the
+// document it was parsed from. The raw form is what gets cached: re-encoding
+// the struct would silently drop any field this client does not model, and the
+// affected ranges it holds are what later scans re-derive their answers from.
+func (c *Client) Advisory(ctx context.Context, id string) (*Advisory, []byte, error) {
 	var a Advisory
-	if err := c.get(ctx, "/v1/vulns/"+id, &a); err != nil {
-		return nil, err
+	raw, err := c.get(ctx, "/v1/vulns/"+id, &a)
+	if err != nil {
+		return nil, nil, err
 	}
-	return &a, nil
+	return &a, raw, nil
+}
+
+// ParseAdvisory decodes a cached advisory document.
+func ParseAdvisory(raw []byte) (*Advisory, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var a Advisory
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return nil, false
+	}
+	return &a, true
 }
 
 func (c *Client) post(ctx context.Context, path string, body []byte, out any) error {
@@ -190,24 +207,27 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return c.do(req, out)
+	_, err = c.do(req, out)
+	return err
 }
 
-func (c *Client) get(ctx context.Context, path string, out any) error {
+func (c *Client) get(ctx context.Context, path string, out any) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Endpoint+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return c.do(req, out)
 }
 
-func (c *Client) do(req *http.Request, out any) error {
+// do sends the request and returns the response body alongside the decoded
+// value, so a caller that wants to keep the original document can.
+func (c *Client) do(req *http.Request, out any) ([]byte, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "container-registry/vuln")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -215,14 +235,14 @@ func (c *Client) do(req *http.Request, out any) error {
 	// should not become a memory problem.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		snippet := strings.TrimSpace(string(body))
 		if len(snippet) > 200 {
 			snippet = snippet[:200] + "…"
 		}
-		return fmt.Errorf("%s %s: %s: %s", req.Method, req.URL.Path, resp.Status, snippet)
+		return nil, fmt.Errorf("%s %s: %s: %s", req.Method, req.URL.Path, resp.Status, snippet)
 	}
-	return json.Unmarshal(body, out)
+	return body, json.Unmarshal(body, out)
 }

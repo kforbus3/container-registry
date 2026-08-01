@@ -763,7 +763,7 @@ function vulnCard(repo, digest, v) {
       <h2>Vulnerabilities</h2>
       <p class="muted small">Not scanned yet. Images are checked against an advisory
       database shortly after their bill of materials is generated.</p>
-      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Scan now</button>
+      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Scan now</button>
     </div>`;
   }
   if (v.status !== 'ok') {
@@ -772,7 +772,7 @@ function vulnCard(repo, digest, v) {
       <p class="muted small">${esc(v.error || 'The advisory database could not be reached.')}</p>
       <p class="muted small">This does <strong>not</strong> mean the image is clean —
       it means it could not be checked.</p>
-      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Retry scan</button>
+      <button class="btn" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Retry scan</button>
     </div>`;
   }
   const total = v.critical + v.high + v.medium + v.low + v.unknown;
@@ -786,7 +786,7 @@ function vulnCard(repo, digest, v) {
     </dl>
     <div class="row" style="margin-top:.8rem">
       ${total ? `<button class="btn primary" onclick="viewVulns('${jsq(repo)}','${jsq(digest)}')">View findings</button>` : ''}
-      <button class="btn ghost" onclick="rescan('${jsq(repo)}','${jsq(digest)}')">Re-scan</button>
+      <button class="btn ghost" onclick="rescan('${jsq(repo)}','${jsq(digest)}',this)">Re-scan</button>
     </div>
   </div>`;
 }
@@ -816,12 +816,45 @@ window.viewVulns = async (repo, digest) => {
   } catch (ex) { toast(ex.message, 'error'); }
 };
 
-window.rescan = async (repo, digest) => {
+window.rescan = async (repo, digest, btn) => {
+  const base = `/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}`;
+  // Remember when the current result was produced, so completion can be
+  // detected rather than guessed at: a re-scan of an unchanged image usually
+  // returns the same counts, and waiting a fixed interval then re-rendering
+  // looks identical to nothing having happened.
+  let before = null;
   try {
-    await api(`/repositories/${encodeURI(repo)}/manifests/${encodeURIComponent(digest)}/rescan`,
-      { method: 'POST' });
-    toast('Scan queued — refresh in a moment', 'success');
-  } catch (ex) { toast(ex.message, 'error'); }
+    const cur = await api(base);
+    before = cur.vulnerabilities ? cur.vulnerabilities.scanned_at : null;
+  } catch { /* no prior scan; any result counts as completion */ }
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+  try {
+    await api(`${base}/rescan`, { method: 'POST' });
+  } catch (ex) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
+    toast(ex.message, 'error');
+    return;
+  }
+
+  // Scanning is queued and hits a third-party advisory database, so it takes
+  // seconds rather than milliseconds. Poll until the timestamp moves.
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let v = null;
+    try {
+      v = (await api(base)).vulnerabilities;
+    } catch { break; }
+    if (v && v.scanned_at !== before) {
+      toast(v.status === 'ok' ? 'Scan complete' : 'Scan finished with errors',
+        v.status === 'ok' ? 'success' : 'error');
+      route();
+      return;
+    }
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
+  toast('Scan is taking longer than expected — it is still running', 'error');
 };
 
 /** Render the SBOM panel for a manifest, generated automatically on push. */
@@ -1130,6 +1163,7 @@ async function renderMaintenance(view) {
   ]);
   const last = gcState.last;
 
+  const st = settings.storage || {};
   view.innerHTML = pageHead('Maintenance', 'Reclaim storage and review the running configuration.') +
     `<div class="card">
       <h2>Garbage collection</h2>
@@ -1156,12 +1190,36 @@ async function renderMaintenance(view) {
     </div>
 
     <div class="card">
-      <h2>Storage</h2>
-      <div class="stat-grid" style="margin-bottom:0">
-        ${stat('On disk', bytes(stats.disk_bytes), `${stats.disk_blob_count} objects`)}
+      <h2>Storage
+        <span class="badge ${st.is_object_store ? 'accent' : ''}">${esc(st.kind || 'filesystem')}</span></h2>
+      <div class="stat-grid" style="margin:0 0 1rem">
+        ${stat('Stored', bytes(stats.disk_bytes), `${stats.disk_blob_count} objects`)}
         ${stat('Referenced', bytes(stats.logical_bytes))}
         ${stat('Unique blobs', stats.blobs)}
       </div>
+      <dl class="kv">
+        ${st.is_object_store ? `
+          <dt>Endpoint</dt><dd class="mono">${esc(st.endpoint || '')}</dd>
+          <dt>Bucket</dt><dd class="mono">${esc(st.bucket || '')}</dd>
+          <dt>Region</dt><dd class="mono">${esc(st.region || '')}</dd>
+          ${st.prefix ? `<dt>Key prefix</dt><dd class="mono">${esc(st.prefix)}</dd>` : ''}
+          <dt>Addressing</dt><dd>${st.path_style ? 'path style' : 'virtual host style'}</dd>
+          <dt>Access key</dt><dd class="mono">${esc(st.access_key || '(anonymous)')}</dd>
+          <dt>Upload scratch</dt><dd class="mono">${esc(st.scratch_dir || '')}</dd>
+        ` : `
+          <dt>Blob directory</dt><dd class="mono">${esc(st.backend || '')}</dd>
+          <dt>Upload scratch</dt><dd class="mono">${esc(st.scratch_dir || '')}</dd>
+        `}
+      </dl>
+      <div class="row" style="margin-top:.8rem">
+        <button class="btn" onclick="checkStorage()">Test connection</button>
+      </div>
+      <p class="muted small" style="margin-top:.7rem">
+        Storage is chosen at start-up from the environment
+        (<code>REGISTRY_S3_BUCKET</code> and friends) and cannot be switched
+        while the registry is running — blobs already written would be stranded
+        in the old backend. Change the environment and restart.
+      </p>
     </div>
 
     <div class="card">
@@ -1194,13 +1252,30 @@ async function renderMaintenance(view) {
       <h2>Configuration</h2>
       <dl class="kv">
         <dt>Listen address</dt><dd class="mono">${esc(settings.addr)}</dd>
-        <dt>Data directory</dt><dd class="mono">${esc(settings.data_dir)}</dd>
         <dt>Auth realm</dt><dd class="mono">${esc(settings.realm)}</dd>
         <dt>TLS</dt><dd>${settings.tls ? '<span class="badge ok">enabled</span>' : '<span class="badge warn">disabled</span>'}</dd>
+        <dt>Token auth</dt><dd>${settings.token_auth
+          ? `<span class="badge ok">enabled</span> <span class="muted small mono">${esc(settings.token_realm || '')}</span>`
+          : '<span class="badge">Basic only</span>'}</dd>
         <dt>Anonymous pull</dt><dd>${settings.anonymous_pull ? '<span class="badge warn">enabled</span>' : '<span class="badge">disabled</span>'}</dd>
+        <dt>Rate limit</dt><dd>${settings.rate_limit
+          ? `${settings.rate_limit}/min reads, ${settings.rate_limit_writes}/min writes, burst ${settings.rate_burst || 'default'}`
+          : '<span class="badge">off</span>'}</dd>
         <dt>Max upload</dt><dd>${settings.max_upload_bytes ? esc(bytes(settings.max_upload_bytes)) : 'unlimited'}</dd>
         <dt>Session lifetime</dt><dd>${esc(settings.session_ttl)}</dd>
+        <dt>SBOM generation</dt><dd>${settings.sbom_enabled ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}</dd>
+        <dt>Vulnerability scan</dt><dd>${settings.vuln_enabled
+          ? `<span class="badge ok">on</span> <span class="muted small mono">${esc(settings.vuln_endpoint || '')}</span>`
+          : '<span class="badge">off</span>'}</dd>
+        <dt>Webhooks</dt><dd>${settings.webhooks_enabled ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}</dd>
+        <dt>Pull-through cache</dt><dd>${settings.proxy_remote
+          ? `<span class="badge ok">on</span> <span class="mono small">${esc(settings.proxy_remote)}</span> under <code>${esc(settings.proxy_prefix || '')}</code>`
+          : '<span class="badge">off</span>'}</dd>
+        <dt>Maintenance</dt><dd>${settings.maintenance_interval && settings.maintenance_interval !== '0s'
+          ? `every ${esc(settings.maintenance_interval)}` : '<span class="badge">on demand only</span>'}</dd>
         <dt>GC grace period</dt><dd>${esc(settings.gc_grace)}</dd>
+        <dt>Metrics</dt><dd><code>/metrics</code>${settings.metrics_protected
+          ? ' <span class="badge ok">token required</span>' : ' <span class="badge warn">unauthenticated</span>'}</dd>
       </dl>
       <p class="muted small" style="margin-top:.8rem">
         These come from environment variables and are fixed for the life of the process.</p>
@@ -1240,6 +1315,18 @@ window.sweepNow = async () => {
     await api('/maintenance/sweep', { method: 'POST' });
     toast('Maintenance complete', 'success');
     route();
+  } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.checkStorage = async () => {
+  toast('Testing the blob store…');
+  try {
+    const res = await api('/storage/check', { method: 'POST' });
+    if (res.ok) {
+      toast(`Storage is reachable and writable (${res.latency_ms} ms)`, 'success');
+    } else {
+      toast(`Storage check failed at ${res.stage}: ${res.error}`, 'error');
+    }
   } catch (ex) { toast(ex.message, 'error'); }
 };
 

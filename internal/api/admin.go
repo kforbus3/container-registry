@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kforbus3/container-registry/internal/auth"
+	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
 	"github.com/kforbus3/container-registry/internal/sbom"
@@ -66,6 +68,7 @@ func (s *Server) adminRouter() http.Handler {
 	mux.Handle("POST /gc", s.requireAdmin(s.handleGCRun))
 
 	mux.Handle("GET /settings", s.requireAdmin(s.handleSettingsGet))
+	mux.Handle("POST /storage/check", s.requireAdmin(s.handleStorageCheck))
 
 	mux.Handle("GET /webhooks", s.requireAdmin(s.handleWebhookList))
 	mux.Handle("POST /webhooks", s.requireAdmin(s.handleWebhookCreate))
@@ -1053,19 +1056,124 @@ func (s *Server) handleGCRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// writeRateLimit reports the limit actually applied to writes, which falls back
+// to the general limit when no separate one is configured.
+func writeRateLimit(cfg *config.Config) int {
+	if cfg.RateLimitWrites > 0 {
+		return cfg.RateLimitWrites
+	}
+	return cfg.RateLimit
+}
+
+// storageView describes where blobs live, in terms an operator can check
+// against what they configured.
+func (s *Server) storageView() map[string]any {
+	out := map[string]any{
+		"backend":         s.Store.Backend(),
+		"scratch_dir":     s.Store.Root(),
+		"is_object_store": false,
+	}
+	if raw, ok := store.S3ConfigFromEnv(); ok {
+		// Report the effective configuration, not the raw environment: an
+		// unset region is us-east-1 in practice, and showing it blank would
+		// misdescribe what the registry is actually doing.
+		cfg := raw.Normalise()
+		out["is_object_store"] = true
+		out["kind"] = "s3"
+		out["endpoint"] = cfg.Endpoint
+		out["bucket"] = cfg.Bucket
+		out["region"] = cfg.Region
+		out["prefix"] = cfg.Prefix
+		out["path_style"] = cfg.PathStyle
+		// Never the secret; enough to tell which credential is in use.
+		out["access_key"] = maskKey(cfg.AccessKey)
+	} else {
+		out["kind"] = "filesystem"
+	}
+	return out
+}
+
+// maskKey shows enough of an access key to identify it without disclosing it.
+func maskKey(k string) string {
+	if k == "" {
+		return ""
+	}
+	if len(k) <= 4 {
+		return strings.Repeat("*", len(k))
+	}
+	return k[:4] + strings.Repeat("*", len(k)-4)
+}
+
+// handleStorageCheck verifies the blob store is actually reachable and
+// writable, which is the question an operator has after configuring one:
+// credentials and bucket policies fail at the first push otherwise.
+func (s *Server) handleStorageCheck(w http.ResponseWriter, r *http.Request) {
+	probe := []byte("registry storage check")
+	started := time.Now()
+
+	digest, err := s.Store.PutBytes(probe)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "stage": "write", "error": err.Error(),
+			"backend": s.Store.Backend(),
+		})
+		return
+	}
+	got, err := s.Store.ReadAll(digest)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "stage": "read", "error": err.Error(),
+			"backend": s.Store.Backend(),
+		})
+		return
+	}
+	if !bytes.Equal(got, probe) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "stage": "verify",
+			"error":   "the object read back does not match what was written",
+			"backend": s.Store.Backend(),
+		})
+		return
+	}
+	// The probe is content-addressed like anything else, so leaving it would be
+	// harmless, but removing it also exercises delete.
+	deleteErr := ""
+	if err := s.Store.Delete(digest); err != nil {
+		deleteErr = err.Error()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"backend":      s.Store.Backend(),
+		"latency_ms":   time.Since(started).Milliseconds(),
+		"delete_error": deleteErr,
+	})
+}
+
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"addr":             s.Cfg.Addr,
-		"data_dir":         s.Cfg.DataDir,
-		"realm":            s.Cfg.Realm,
-		"tls":              s.Cfg.TLSEnabled(),
-		"anonymous_pull":   s.Cfg.AllowAnonymousPull,
-		"max_upload_bytes": s.Cfg.MaxUploadBytes,
-		"session_ttl":      s.Cfg.SessionTTL.String(),
-		"storage_root":     s.Store.Root(),
-		"storage_backend":  s.Store.Backend(),
-		"gc_grace":         s.collector.Grace.String(),
-		"gc_upload_ttl":    s.collector.UploadTTL.String(),
+		"addr":                 s.Cfg.Addr,
+		"data_dir":             s.Cfg.DataDir,
+		"realm":                s.Cfg.Realm,
+		"tls":                  s.Cfg.TLSEnabled(),
+		"anonymous_pull":       s.Cfg.AllowAnonymousPull,
+		"max_upload_bytes":     s.Cfg.MaxUploadBytes,
+		"session_ttl":          s.Cfg.SessionTTL.String(),
+		"storage":              s.storageView(),
+		"gc_grace":             s.collector.Grace.String(),
+		"gc_upload_ttl":        s.collector.UploadTTL.String(),
+		"maintenance_interval": s.Cfg.MaintenanceInterval.String(),
+		"sbom_enabled":         s.Cfg.SBOMEnabled,
+		"vuln_enabled":         s.Cfg.VulnEnabled,
+		"vuln_endpoint":        s.Cfg.VulnEndpoint,
+		"webhooks_enabled":     s.Cfg.WebhooksEnabled,
+		"rate_limit":           s.Cfg.RateLimit,
+		"rate_limit_writes":    writeRateLimit(s.Cfg),
+		"rate_burst":           s.Cfg.RateBurst,
+		"token_auth":           s.Cfg.TokenAuth,
+		"token_realm":          s.Cfg.TokenRealm,
+		"proxy_remote":         s.Cfg.ProxyRemote,
+		"proxy_prefix":         s.Cfg.ProxyPrefix,
+		"metrics_protected":    s.Cfg.MetricsToken != "",
 	})
 }
 

@@ -302,6 +302,19 @@ func (b *S3Backend) Walk(ctx context.Context, prefix string, fn func(ObjectInfo)
 	}
 }
 
+// Normalise fills in the defaults NewS3Backend would apply, so a caller
+// reporting the configuration shows what is actually in effect rather than the
+// raw environment.
+func (c S3Config) Normalise() S3Config {
+	if c.Region == "" {
+		c.Region = "us-east-1"
+	}
+	if c.Endpoint == "" {
+		c.Endpoint = "https://s3." + c.Region + ".amazonaws.com"
+	}
+	return c
+}
+
 // S3ConfigFromEnv reads S3 settings from the environment, reporting whether an
 // object store was configured at all.
 func S3ConfigFromEnv() (S3Config, bool) {

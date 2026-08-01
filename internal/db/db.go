@@ -307,6 +307,15 @@ CREATE TABLE repo_grants (
 );
 CREATE INDEX idx_grants_user ON repo_grants(user_id);
 `},
+
+	{"007_advisory_documents", `
+-- The advisory cache stored only a summary, so a cache hit lost the affected
+-- ranges -- and with them the fix version and the ability to check whether an
+-- advisory applies to the installed version at all. That made a re-scan report
+-- different results from the first scan. Keeping the document makes a cache hit
+-- and a fresh fetch produce identical findings.
+ALTER TABLE vuln_advisories ADD COLUMN document TEXT NOT NULL DEFAULT '';
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

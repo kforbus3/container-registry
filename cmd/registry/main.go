@@ -168,6 +168,9 @@ func run() error {
 		Log:          log,
 		Interval:     cfg.MaintenanceInterval,
 		InitialDelay: cfg.MaintenanceDelay,
+		// Past this the advisory would be refetched anyway, so an unreferenced
+		// one is not worth the several kilobytes its document occupies.
+		AdvisoryTTL: cfg.VulnAdvisoryTTL,
 	}
 	srv.SetScheduler(scheduler)
 	go scheduler.Run(ctx)
