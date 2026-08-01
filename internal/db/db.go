@@ -286,6 +286,12 @@ CREATE TABLE webhook_deliveries (
 );
 CREATE INDEX idx_deliveries_hook ON webhook_deliveries(webhook_id, id DESC);
 `},
+
+	{"005_quotas", `
+-- A storage ceiling per repository. Zero or absent means unlimited, so the
+-- feature is opt-in and an upgrade changes nothing.
+ALTER TABLE repositories ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0;
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

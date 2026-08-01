@@ -63,6 +63,9 @@ type Repository struct {
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 
+	// QuotaBytes caps how much this repository may store. Zero is unlimited.
+	QuotaBytes int64 `json:"quota_bytes"`
+
 	// Populated by ListRepositories.
 	TagCount  int   `json:"tag_count"`
 	SizeBytes int64 `json:"size_bytes"`
@@ -340,13 +343,14 @@ func (d *DB) TouchToken(ctx context.Context, id int64) {
 
 // ---------------------------------------------------------------- repositories
 
-const repoCols = `id, name, public, immutable, description, created_at, updated_at`
+const repoCols = `id, name, public, immutable, description, quota_bytes, created_at, updated_at`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repository, error) {
 	var r Repository
 	var public, immutable int
 	var created, updated string
-	if err := row.Scan(&r.ID, &r.Name, &public, &immutable, &r.Description, &created, &updated); err != nil {
+	if err := row.Scan(&r.ID, &r.Name, &public, &immutable, &r.Description,
+		&r.QuotaBytes, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -382,7 +386,8 @@ func (d *DB) EnsureRepository(ctx context.Context, name string) (*Repository, er
 // and on-disk size (the sum of distinct blobs linked to the repository).
 func (d *DB) ListRepositories(ctx context.Context) ([]*Repository, error) {
 	rows, err := d.QueryContext(ctx, `
-		SELECT r.id, r.name, r.public, r.immutable, r.description, r.created_at, r.updated_at,
+		SELECT r.id, r.name, r.public, r.immutable, r.description, r.quota_bytes,
+		       r.created_at, r.updated_at,
 		       (SELECT COUNT(*) FROM tags  t WHERE t.repo_id = r.id),
 		       (SELECT COALESCE(SUM(b.size),0) FROM blobs b WHERE b.repo_id = r.id)
 		FROM repositories r ORDER BY r.name`)
@@ -395,8 +400,8 @@ func (d *DB) ListRepositories(ctx context.Context) ([]*Repository, error) {
 		var r Repository
 		var public, immutable int
 		var created, updated string
-		if err := rows.Scan(&r.ID, &r.Name, &public, &immutable, &r.Description, &created, &updated,
-			&r.TagCount, &r.SizeBytes); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &public, &immutable, &r.Description,
+			&r.QuotaBytes, &created, &updated, &r.TagCount, &r.SizeBytes); err != nil {
 			return nil, err
 		}
 		r.Public, r.Immutable = public != 0, immutable != 0
@@ -436,6 +441,69 @@ func (d *DB) UpdateRepository(ctx context.Context, id int64, public, immutable b
 		`UPDATE repositories SET public = ?, immutable = ?, description = ?, updated_at = ? WHERE id = ?`,
 		boolInt(public), boolInt(immutable), description, nowStr(), id)
 	return err
+}
+
+// SetRepositoryQuota caps a repository's storage. Zero removes the cap.
+func (d *DB) SetRepositoryQuota(ctx context.Context, id int64, quota int64) error {
+	_, err := d.ExecContext(ctx,
+		`UPDATE repositories SET quota_bytes = ?, updated_at = ? WHERE id = ?`,
+		quota, nowStr(), id)
+	return err
+}
+
+// RepositorySize reports the bytes a repository currently accounts for, which
+// is the sum of the distinct blobs linked to it.
+func (d *DB) RepositorySize(ctx context.Context, repoID int64) (int64, error) {
+	var n int64
+	err := d.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size),0) FROM blobs WHERE repo_id = ?`, repoID).Scan(&n)
+	return n, err
+}
+
+// TagPage is one page of a repository's tags with their metadata.
+type TagPage struct {
+	Tags  []*Tag `json:"tags"`
+	Total int    `json:"total"`
+}
+
+// ListTagsPage returns tags in name order with a bound, so a repository with
+// thousands of tags does not have to be rendered in full.
+func (d *DB) ListTagsPage(ctx context.Context, repoID int64, search string, limit, offset int) (*TagPage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	like := "%" + search + "%"
+
+	page := &TagPage{Tags: []*Tag{}}
+	if err := d.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tags WHERE repo_id = ? AND name LIKE ?`,
+		repoID, like).Scan(&page.Total); err != nil {
+		return nil, err
+	}
+	rows, err := d.QueryContext(ctx, `
+		SELECT t.name, t.digest, t.created_at, t.updated_at,
+		       COALESCE(m.media_type,''),
+		       COALESCE((SELECT SUM(r.size) FROM manifest_refs r WHERE r.manifest_id = m.id), 0)
+		FROM tags t LEFT JOIN manifests m ON m.repo_id = t.repo_id AND m.digest = t.digest
+		WHERE t.repo_id = ? AND t.name LIKE ?
+		ORDER BY t.name LIMIT ? OFFSET ?`, repoID, like, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t Tag
+		var created, updated string
+		if err := rows.Scan(&t.Name, &t.Digest, &created, &updated, &t.MediaType, &t.Size); err != nil {
+			return nil, err
+		}
+		t.CreatedAt, t.UpdatedAt = parseTS(created), parseTS(updated)
+		page.Tags = append(page.Tags, &t)
+	}
+	return page, rows.Err()
 }
 
 func (d *DB) TouchRepository(ctx context.Context, id int64) {

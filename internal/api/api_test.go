@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1358,5 +1359,141 @@ func TestNoRateLimitByDefault(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		resp := h.do(http.MethodGet, "/v2/", nil)
 		h.expectStatus(resp, http.StatusOK, "unlimited request")
+	}
+}
+
+// ------------------------------------------------- metrics, quotas, pagination
+
+func TestMetricsExposition(t *testing.T) {
+	h := newHarness(t)
+	h.pushImage("team-a/app", "v1")
+
+	resp := h.do(http.MethodGet, "/metrics", nil, anonymous())
+	body := h.expectStatus(resp, http.StatusOK, "metrics")
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	for _, want := range []string{
+		"# TYPE registry_requests_total counter",
+		"registry_repositories 1",
+		"registry_uptime_seconds",
+	} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("missing %q in metrics output", want)
+		}
+	}
+	// Paths must not become labels, or one label per repository would make the
+	// scrape unbounded.
+	if bytes.Contains(body, []byte("team-a/app")) {
+		t.Error("a repository name leaked into a metric label")
+	}
+}
+
+func TestMetricsTokenGuard(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.MetricsToken = "scrape-me"
+
+	resp := h.do(http.MethodGet, "/metrics", nil, anonymous())
+	h.expectStatus(resp, http.StatusUnauthorized, "metrics without a token")
+
+	resp = h.do(http.MethodGet, "/metrics", nil, func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer scrape-me")
+	})
+	h.expectStatus(resp, http.StatusOK, "metrics with the token")
+}
+
+// A quota rejects the push that would exceed it, and the repository is not
+// charged for the blob that was refused.
+func TestRepositoryQuotaBlocksPush(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// Seed a blob so the repository exists and has a known size.
+	first := []byte("0123456789")
+	h.pushBlob("team-a/quota", first)
+
+	repo, err := h.db.GetRepository(ctx, "team-a/quota")
+	if err != nil {
+		t.Fatalf("GetRepository: %v", err)
+	}
+	// Cap just above what is already stored.
+	if err := h.db.SetRepositoryQuota(ctx, repo.ID, 15); err != nil {
+		t.Fatalf("SetRepositoryQuota: %v", err)
+	}
+
+	// A blob that fits is still accepted.
+	small := []byte("abc")
+	resp := h.do(http.MethodPost, "/v2/team-a/quota/blobs/uploads/?digest="+store.Digest(small), small)
+	h.expectStatus(resp, http.StatusCreated, "a blob within the quota")
+
+	// One that does not is refused.
+	big := bytes.Repeat([]byte("x"), 100)
+	resp = h.do(http.MethodPost, "/v2/team-a/quota/blobs/uploads/?digest="+store.Digest(big), big)
+	body := h.expectStatus(resp, http.StatusRequestEntityTooLarge, "a blob over the quota")
+	if !bytes.Contains(body, []byte("quota")) {
+		t.Fatalf("the error should explain the quota: %s", body)
+	}
+
+	// And the refused blob must not have been charged to the repository.
+	used, err := h.db.RepositorySize(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("RepositorySize: %v", err)
+	}
+	if used > 15 {
+		t.Fatalf("repository is charged %d bytes, above its own quota", used)
+	}
+}
+
+func TestNoQuotaByDefault(t *testing.T) {
+	h := newHarness(t)
+	big := bytes.Repeat([]byte("y"), 4096)
+	resp := h.do(http.MethodPost, "/v2/team-a/free/blobs/uploads/?digest="+store.Digest(big), big)
+	h.expectStatus(resp, http.StatusCreated, "an unlimited repository accepts anything")
+}
+
+// A repository with many tags must be servable a page at a time.
+func TestTagPagination(t *testing.T) {
+	h := newHarness(t)
+	digest := h.pushImage("team-a/many", "seed")
+	body := mustManifestBytes(h, "team-a/many", digest)
+	for i := 0; i < 25; i++ {
+		tag := fmt.Sprintf("v%02d", i)
+		resp := h.do(http.MethodPut, "/v2/team-a/many/manifests/"+tag, body,
+			contentType(MediaTypeOCIManifest))
+		h.expectStatus(resp, http.StatusCreated, "seed tag "+tag)
+	}
+
+	var page struct {
+		Tags  []map[string]any `json:"tags"`
+		Total int              `json:"total"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories/team-a/many/tags?limit=10", nil),
+		http.StatusOK, &page)
+	if len(page.Tags) != 10 {
+		t.Fatalf("returned %d tags, want the requested 10", len(page.Tags))
+	}
+	if page.Total != 26 {
+		t.Fatalf("total = %d, want 26 (25 plus the seed)", page.Total)
+	}
+
+	// The second page continues rather than repeating.
+	var second struct {
+		Tags []map[string]any `json:"tags"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories/team-a/many/tags?limit=10&offset=10", nil),
+		http.StatusOK, &second)
+	if len(second.Tags) != 10 || second.Tags[0]["name"] == page.Tags[0]["name"] {
+		t.Fatal("the second page repeated the first")
+	}
+
+	// Search narrows the set.
+	var found struct {
+		Tags  []map[string]any `json:"tags"`
+		Total int              `json:"total"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories/team-a/many/tags?search=v1", nil),
+		http.StatusOK, &found)
+	if found.Total != 10 {
+		t.Fatalf("search for v1 matched %d, want the ten v1x tags", found.Total)
 	}
 }

@@ -71,6 +71,8 @@ type Config struct {
 	WebhookQueue   int
 	// WebhookTimeout bounds a single delivery attempt.
 	WebhookTimeout time.Duration
+	// MetricsToken, when set, requires a bearer token on /metrics.
+	MetricsToken string
 }
 
 func Load() (*Config, error) {
@@ -96,6 +98,7 @@ func Load() (*Config, error) {
 		WebhooksEnabled:    envBool("REGISTRY_WEBHOOKS", true),
 		WebhookWorkers:     envInt("REGISTRY_WEBHOOK_WORKERS", 2),
 		WebhookQueue:       envInt("REGISTRY_WEBHOOK_QUEUE", 512),
+		MetricsToken:       os.Getenv("REGISTRY_METRICS_TOKEN"),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 

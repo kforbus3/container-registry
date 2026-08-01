@@ -1152,6 +1152,7 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 			Public      *bool   `json:"public"`
 			Immutable   *bool   `json:"immutable"`
 			Description *string `json:"description"`
+			QuotaBytes  *int64  `json:"quota_bytes"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
@@ -1174,6 +1175,21 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		if err := s.DB.UpdateRepository(r.Context(), repo.ID, public, immutable, desc); err != nil {
 			writeErr(w, http.StatusInternalServerError, "failed to update repository")
 			return
+		}
+		if req.QuotaBytes != nil {
+			if *req.QuotaBytes < 0 {
+				writeErr(w, http.StatusBadRequest, "quota_bytes cannot be negative")
+				return
+			}
+			if !principalFrom(r.Context()).Admin {
+				writeErr(w, http.StatusForbidden, "only administrators can set a quota")
+				return
+			}
+			if err := s.DB.SetRepositoryQuota(r.Context(), repo.ID, *req.QuotaBytes); err != nil {
+				writeErr(w, http.StatusInternalServerError, "failed to set quota")
+				return
+			}
+			s.audit(r, "repo.quota", repo.Name, "", strconv.FormatInt(*req.QuotaBytes, 10))
 		}
 		s.audit(r, "repo.update", repo.Name, "",
 			fmt.Sprintf("public=%v immutable=%v", public, immutable))
@@ -1200,12 +1216,20 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 func (s *Server) repoTags(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
 	switch r.Method {
 	case http.MethodGet:
-		tags, err := s.DB.ListTagsDetailed(r.Context(), repo.ID)
+		// Paged, because a repository with thousands of tags should not have to
+		// be rendered in full to look at the first few.
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		page, err := s.DB.ListTagsPage(r.Context(), repo.ID,
+			r.URL.Query().Get("search"), limit, offset)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "failed to list tags")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"tags": tags})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tags": page.Tags, "total": page.Total,
+			"limit": limit, "offset": offset,
+		})
 
 	case http.MethodPost:
 		s.createTag(w, r, repo)

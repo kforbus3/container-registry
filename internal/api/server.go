@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kforbus3/container-registry/internal/auth"
 	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/metrics"
 	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
@@ -40,9 +43,10 @@ type Server struct {
 	scheduler *gc.Scheduler
 	retention *gc.Retention
 
-	reads  *ratelimit.Limiter
-	writes *ratelimit.Limiter
-	hooks  *webhook.Dispatcher
+	reads   *ratelimit.Limiter
+	writes  *ratelimit.Limiter
+	hooks   *webhook.Dispatcher
+	Metrics *metrics.Registry
 }
 
 // SetRateLimits installs per-caller limits. Writes are limited separately
@@ -95,7 +99,10 @@ func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request) bool {
 func urlPathUnescape(s string) (string, error) { return url.PathUnescape(s) }
 
 func NewServer(cfg *config.Config, database *db.DB, st *store.Store, log *slog.Logger) *Server {
-	return &Server{Cfg: cfg, DB: database, Store: st, Auth: auth.New(database), Log: log}
+	return &Server{
+		Cfg: cfg, DB: database, Store: st, Auth: auth.New(database), Log: log,
+		Metrics: metrics.New(),
+	}
 }
 
 const sessionCookie = "registry_session"
@@ -282,9 +289,64 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.Handle("/", s.uiHandler())
 
 	return s.withCommonHeaders(s.withRecovery(s.withLogging(mux)))
+}
+
+// handleMetrics serves the Prometheus exposition format.
+//
+// It is unauthenticated by default because that is what every scraper expects
+// and the numbers are counts rather than content; set REGISTRY_METRICS_TOKEN to
+// require a bearer token when the endpoint is reachable from outside.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if want := s.Cfg.MetricsToken; want != "" {
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+			writeErr(w, http.StatusUnauthorized, "metrics token required")
+			return
+		}
+	}
+	s.refreshGauges(r)
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	s.Metrics.Write(w)
+}
+
+// refreshGauges samples the values that describe current state rather than
+// accumulated activity.
+func (s *Server) refreshGauges(r *http.Request) {
+	if st, err := s.DB.Stats(r.Context()); err == nil {
+		s.Metrics.SetGauge("registry_repositories", "Repositories in the registry.", nil, float64(st.Repositories))
+		s.Metrics.SetGauge("registry_tags", "Tags across all repositories.", nil, float64(st.Tags))
+		s.Metrics.SetGauge("registry_manifests", "Manifests stored.", nil, float64(st.Manifests))
+		s.Metrics.SetGauge("registry_blobs", "Distinct blobs stored.", nil, float64(st.Blobs))
+		s.Metrics.SetGauge("registry_storage_bytes", "Bytes referenced by live manifests.", nil, float64(st.SizeBytes))
+		s.Metrics.SetGauge("registry_users", "User accounts.", nil, float64(st.Users))
+		s.Metrics.SetGauge("registry_tokens_active", "Tokens that have not been revoked.", nil, float64(st.ActiveTokens))
+	}
+	if vs, err := s.DB.VulnStats(r.Context()); err == nil {
+		s.Metrics.SetGauge("registry_images_scanned", "Images checked against an advisory database.", nil, float64(vs.Scanned))
+		for severity, n := range map[string]int{
+			"critical": vs.Critical, "high": vs.High, "medium": vs.Medium, "low": vs.Low,
+		} {
+			s.Metrics.SetGauge("registry_vulnerabilities",
+				"Open findings by severity.", metrics.Labels{"severity": severity}, float64(n))
+		}
+	}
+	if s.sbom != nil {
+		st := s.sbom.Stats()
+		s.Metrics.SetGauge("registry_sbom_generated", "SBOMs published since start-up.", nil, float64(st.Generated))
+		s.Metrics.SetGauge("registry_sbom_failed", "SBOM generations that failed.", nil, float64(st.Failed))
+	}
+	if s.hooks != nil {
+		st := s.hooks.Stats()
+		s.Metrics.SetGauge("registry_webhook_delivered", "Webhook deliveries that succeeded.", nil, float64(st.Delivered))
+		s.Metrics.SetGauge("registry_webhook_failed", "Webhook deliveries that failed.", nil, float64(st.Failed))
+		s.Metrics.SetGauge("registry_webhook_dropped", "Events dropped because the queue was full.", nil, float64(st.Dropped))
+	}
 }
 
 func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
@@ -337,13 +399,54 @@ func (sr *statusRecorder) Write(b []byte) (int, error) {
 
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sr, r)
+
+		// Bucket by the kind of request rather than the exact path: a label per
+		// repository would give the scrape unbounded cardinality.
+		s.Metrics.Inc("registry_requests_total", "Requests served, by kind and status.",
+			metrics.Labels{
+				"kind":   requestKind(r.URL.Path),
+				"method": r.Method,
+				"code":   strconv.Itoa(sr.status),
+			})
+		s.Metrics.Add("registry_request_duration_seconds_sum",
+			"Total time spent serving requests, by kind.",
+			metrics.Labels{"kind": requestKind(r.URL.Path)}, time.Since(started).Seconds())
 		// Static UI assets would drown out anything useful.
 		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/v2") || strings.HasPrefix(r.URL.Path, "/api") {
 			s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "status", sr.status, "ip", remoteIP(r))
 		}
 	})
+}
+
+// requestKind classifies a path into a small fixed set, so metric cardinality
+// stays bounded no matter how many repositories exist.
+func requestKind(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/v2/"):
+		switch {
+		case strings.Contains(path, "/blobs/uploads/"):
+			return "blob_upload"
+		case strings.Contains(path, "/blobs/"):
+			return "blob"
+		case strings.Contains(path, "/manifests/"):
+			return "manifest"
+		case strings.Contains(path, "/tags/"):
+			return "tags"
+		case strings.Contains(path, "/referrers/"):
+			return "referrers"
+		}
+		return "v2"
+	case strings.HasPrefix(path, "/api/"):
+		return "api"
+	case path == "/metrics":
+		return "metrics"
+	case path == "/healthz":
+		return "health"
+	}
+	return "ui"
 }
 
 // errIsNotFound flattens the two not-found sentinels used across packages.

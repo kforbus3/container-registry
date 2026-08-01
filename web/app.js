@@ -378,11 +378,21 @@ async function renderRepositories(view) {
 
 // ---- repository detail
 
-async function renderRepo(view, [name]) {
+const TAG_PAGE_SIZE = 25;
+
+async function renderRepo(view, [name, offsetArg, searchArg]) {
   if (!name) { location.hash = '#/repositories'; return; }
+  const offset = parseInt(offsetArg, 10) || 0;
+  const search = searchArg ? decodeURIComponent(searchArg) : '';
   const data = await api(`/repositories/${encodeURI(name)}`);
+  // Tags come from a paged endpoint rather than the repository payload, so a
+  // repository with thousands of them does not render every row.
+  const tagPage = await api(
+    `/repositories/${encodeURI(name)}/tags?limit=${TAG_PAGE_SIZE}` +
+    `&offset=${offset}&search=${encodeURIComponent(search)}`);
   const repo = data.repository;
-  const tags = data.tags || [];
+  const tags = tagPage.tags || [];
+  const totalTags = tagPage.total || 0;
   const untagged = data.untagged_manifests || [];
   const referrers = data.referrer_manifests || [];
   const host = location.host;
@@ -429,13 +439,25 @@ async function renderRepo(view, [name]) {
       ${stat('Untagged', untagged.length, 'reclaimable by GC')}
       ${stat('Attached artifacts', referrers.length, 'SBOMs, signatures')}
       ${stat('Visibility', repo.public ? 'Public' : 'Private')}
+      ${stat('Storage', bytes(data.used_bytes || 0),
+        repo.quota_bytes ? `of ${bytes(repo.quota_bytes)} quota` : 'no quota')}
     </div>
 
     <div class="card">
-      <h2>Tags</h2>
+      <h2>Tags <span class="badge">${totalTags}</span></h2>
+      <div class="field"><input id="tag-search" placeholder="Filter tags…" value="${esc(search)}"></div>
       ${tableOrEmpty(tagRows,
         `<tr><th>Tag</th>${anyScanned ? '<th>Risk</th>' : ''}<th>Digest</th><th class="num">Size</th><th>Updated</th><th></th></tr>`,
-        'No tags in this repository.')}
+        search ? 'No tags match that filter.' : 'No tags in this repository.')}
+      ${totalTags > TAG_PAGE_SIZE ? `<div class="row" style="margin-top:.8rem;justify-content:space-between">
+        <span class="muted small">${offset + 1}–${Math.min(offset + TAG_PAGE_SIZE, totalTags)} of ${totalTags}</span>
+        <span class="row">
+          <button class="btn small" ${offset === 0 ? 'disabled' : ''}
+            onclick="tagPage('${jsq(repo.name)}',${Math.max(0, offset - TAG_PAGE_SIZE)},'${jsq(search)}')">Previous</button>
+          <button class="btn small" ${offset + TAG_PAGE_SIZE >= totalTags ? 'disabled' : ''}
+            onclick="tagPage('${jsq(repo.name)}',${offset + TAG_PAGE_SIZE},'${jsq(search)}')">Next</button>
+        </span>
+      </div>` : ''}
     </div>
 
     ${referrers.length ? `<div class="card">
@@ -487,6 +509,8 @@ async function renderRepo(view, [name]) {
       <h2>Pull this image</h2>
       <pre>docker pull ${esc(host)}/${esc(repo.name)}:${esc(tags[0] ? tags[0].name : 'latest')}</pre>
     </div>`;
+
+  bindTagSearch(repo.name);
 }
 
 window.addRule = async (repo) => {
@@ -534,6 +558,10 @@ window.deleteRule = async (repo, id) => {
   } catch (ex) { toast(ex.message, 'error'); }
 };
 
+window.tagPage = (repo, offset, search) => {
+  location.hash = `#/repo/${encodeURIComponent(repo)}/${offset}/${encodeURIComponent(search || '')}`;
+};
+
 window.deleteTag = async (repo, tag) => {
   if (!await confirmDanger('Delete tag', `Delete tag "${tag}" from ${repo}? The manifest stays until garbage collection runs.`)) return;
   try {
@@ -542,6 +570,15 @@ window.deleteTag = async (repo, tag) => {
     route();
   } catch (ex) { toast(ex.message, 'error'); }
 };
+
+// Bind the tag filter after each repository render.
+function bindTagSearch(repoName) {
+  const box = document.getElementById('tag-search');
+  if (!box) return;
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') window.tagPage(repoName, 0, box.value.trim());
+  });
+}
 
 window.deleteRepo = async (repo) => {
   if (!await confirmDanger('Delete repository',
@@ -585,7 +622,13 @@ window.editRepo = async (repo) => {
         Public — any authenticated user can pull</label>
       <label class="check" style="margin-top:.5rem">
         <input type="checkbox" name="immutable" ${r.immutable ? 'checked' : ''}>
-        Immutable — existing tags cannot be moved to a different image</label>`,
+        Immutable — existing tags cannot be moved to a different image</label>
+      ${state.me.admin ? `<div class="field" style="margin-top:.8rem">
+        <label>Storage quota (MB)</label>
+        <input name="quota_mb" type="number" min="0"
+          value="${r.quota_bytes ? Math.round(r.quota_bytes / 1048576) : 0}">
+        <span class="hint">0 means unlimited. A push that would exceed it is refused.</span>
+      </div>` : ''}`,
   });
   if (!v) return;
   try {
@@ -595,6 +638,9 @@ window.editRepo = async (repo) => {
         description: v.description,
         public: !!v.public,
         immutable: !!v.immutable,
+        ...(v.quota_mb !== undefined
+          ? { quota_bytes: (parseInt(v.quota_mb, 10) || 0) * 1048576 }
+          : {}),
       }),
     });
     toast('Repository updated', 'success');

@@ -1074,6 +1074,18 @@ func (s *Server) completeUploadAt(w http.ResponseWriter, r *http.Request, repo *
 		s.uploadError(w, err, id)
 		return
 	}
+	// Enforce the quota after the bytes have landed but before the blob is
+	// linked, so an over-quota push is rejected without the repository being
+	// charged for it. The orphaned blob is reclaimed by garbage collection.
+	if repo.QuotaBytes > 0 {
+		used, err := s.DB.RepositorySize(r.Context(), repo.ID)
+		if err == nil && used+size > repo.QuotaBytes {
+			s.ociErr(w, http.StatusRequestEntityTooLarge, codeDenied,
+				fmt.Sprintf("repository quota exceeded: %d bytes used of %d, this blob adds %d",
+					used, repo.QuotaBytes, size), nil)
+			return
+		}
+	}
 	if err := s.DB.LinkBlob(r.Context(), repo.ID, digest, size); err != nil {
 		s.ociErr(w, http.StatusInternalServerError, codeUnsupported, "failed to record blob", nil)
 		return

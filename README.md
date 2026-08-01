@@ -160,6 +160,7 @@ referrer attached by ORAS, discovered back through the referrers API.
   (existing tags cannot be moved to different content)
 - Every push, delete, tag and administrative change is written to an audit log
 - Per-caller rate limiting, with pushes limited separately from reads
+- Per-repository storage quotas, enforced on push
 
 **Webhooks**
 
@@ -173,8 +174,10 @@ referrer attached by ORAS, discovered back through the referrers API.
 
 **Management**
 
-- Web UI: repository browser, tag and layer inspection, image config and build
-  history, token issue/revoke, user management, audit log, garbage collection
+- Web UI: repository browser with paged and searchable tags, layer inspection,
+  image config and build history, token issue/revoke, user management, audit
+  log, retention rules, webhooks and maintenance
+- Prometheus metrics at `/metrics`, with bounded label cardinality
 - Mark-and-sweep garbage collection with a dry-run mode and a configurable
   grace period that protects in-flight pushes
 - Retention rules per repository — keep the newest N, delete older than a
@@ -226,6 +229,7 @@ All configuration is by environment variable.
 | `REGISTRY_WEBHOOK_WORKERS` | `2` | Concurrent deliveries |
 | `REGISTRY_WEBHOOK_QUEUE` | `512` | Backlog before events are dropped |
 | `REGISTRY_WEBHOOK_TIMEOUT` | `10s` | Per-attempt timeout |
+| `REGISTRY_METRICS_TOKEN` | — | Require a bearer token on `/metrics` |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -493,6 +497,44 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Metrics
+
+`/metrics` serves the Prometheus text format, written directly rather than by
+depending on the client library: the registry publishes a few dozen series with
+no histograms, and the format is a documented handful of lines.
+
+Requests are labelled by *kind* — `blob`, `blob_upload`, `manifest`, `tags`,
+`api` — rather than by path. A label per repository would give the scrape
+unbounded cardinality, which is the usual way a metrics endpoint becomes the
+most expensive thing in a system.
+
+Gauges cover repositories, tags, manifests, blobs, storage bytes, images
+scanned and open findings by severity, plus SBOM and webhook activity.
+
+The endpoint is unauthenticated by default, because that is what every scraper
+expects and the values are counts rather than content. Set
+`REGISTRY_METRICS_TOKEN` to require `Authorization: Bearer` when it is
+reachable from outside.
+
+---
+
+## Quotas
+
+A repository with no quota is unlimited, so this changes nothing until set:
+
+```bash
+curl -u admin:PASSWORD -X PATCH \
+  http://localhost:5001/api/repositories/team-a/app \
+  -H 'Content-Type: application/json' -d '{"quota_bytes": 5368709120}'
+```
+
+The check runs after a blob's bytes have landed but before it is linked to the
+repository, so an over-quota push is refused without the repository being
+charged for it; the orphaned blob is reclaimed by the next collection. Setting a
+quota is administrator-only.
 
 ---
 
