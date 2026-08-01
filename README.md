@@ -158,6 +158,7 @@ referrer attached by ORAS, discovered back through the referrers API.
 - Tokens can never exceed the rights of the user that owns them
 - Repositories can be marked public (readable by anyone) or immutable
   (existing tags cannot be moved to different content)
+- Per-repository access grants with graded roles, opt-in per repository
 - Every push, delete, tag and administrative change is written to an audit log
 - Per-caller rate limiting, with pushes limited separately from reads
 - Per-repository storage quotas, enforced on push
@@ -171,6 +172,14 @@ referrer attached by ORAS, discovered back through the referrers API.
 - Retry with backoff on server errors, no retry on a 4xx that will not improve
 - Delivery history per hook, so a webhook that is not arriving can be diagnosed
   from the registry rather than from the receiver's logs
+
+**Pull-through cache**
+
+- Mirror an upstream registry: an image pulled once is served locally forever
+  after, so a build farm counts as one puller rather than hundreds
+- Handles the Docker token-auth flow, with per-scope token caching
+- Scoped to a prefix, so one registry can hold its own images and mirror an
+  upstream at the same time
 
 **Management**
 
@@ -230,6 +239,10 @@ All configuration is by environment variable.
 | `REGISTRY_WEBHOOK_QUEUE` | `512` | Backlog before events are dropped |
 | `REGISTRY_WEBHOOK_TIMEOUT` | `10s` | Per-attempt timeout |
 | `REGISTRY_METRICS_TOKEN` | — | Require a bearer token on `/metrics` |
+| `REGISTRY_PROXY_REMOTE` | — | Upstream registry to cache, e.g. `https://registry-1.docker.io` |
+| `REGISTRY_PROXY_PREFIX` | `proxy` | Namespace the cache lives under; empty mirrors everything |
+| `REGISTRY_PROXY_USERNAME` / `REGISTRY_PROXY_PASSWORD` | — | Upstream credentials; anonymous pulls have far lower limits |
+| `REGISTRY_PROXY_TIMEOUT` | `120s` | Upstream request timeout |
 | `REGISTRY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The bootstrap administrator is created only when the user table is empty. If
@@ -317,6 +330,8 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` `POST` | `/api/repositories/<name>/retention` | List / create retention rules |
 | `PATCH` `DELETE` | `/api/repositories/<name>/retention/<id>` | Enable / remove a rule |
 | `POST` | `/api/retention/preview` | Show what a sweep would delete *(admin)* |
+| `GET` `POST` | `/api/repositories/<name>/grants` | List / create access grants |
+| `DELETE` | `/api/repositories/<name>/grants/<user>` | Revoke a grant |
 | `GET` `POST` | `/api/webhooks` | List / create webhooks *(admin)* |
 | `DELETE` | `/api/webhooks/<id>` | Remove a webhook *(admin)* |
 | `GET` | `/api/webhooks/<id>/deliveries` | Delivery history *(admin)* |
@@ -497,6 +512,56 @@ over-reporting for language packages bundled by a distribution: RHEL ships
 the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
+
+---
+
+## Pull-through cache
+
+Setting `REGISTRY_PROXY_REMOTE` makes the registry mirror an upstream. An image
+under the proxy prefix that is missing locally is fetched, stored, and served
+from here from then on:
+
+```bash
+REGISTRY_PROXY_REMOTE=https://registry-1.docker.io
+REGISTRY_PROXY_USERNAME=...    # anonymous works, at a much lower rate limit
+```
+
+```bash
+docker pull registry.example.com/proxy/library/alpine:3.20
+```
+
+The prefix scopes it, so `proxy/library/alpine` comes from upstream while
+`team-a/app` stays purely local. Set an empty prefix to mirror everything.
+
+Upstream blobs are streamed through the same upload path as a push, so their
+digests are verified on the way in — an upstream is not more trusted than a
+client. The Docker token-auth flow is handled, with tokens cached per scope
+because upstreams issue one per repository and re-fetching for every blob would
+triple the request count.
+
+**Verified against Docker Hub**: pulling `proxy/library/alpine:3.20` fetched the
+multi-platform index and its blobs, and a second pull made no upstream requests
+at all.
+
+---
+
+## Repository access grants
+
+By default any user who can reach a repository may use it. Adding the first
+grant governs that repository, and from then on only the people named on it have
+access:
+
+```bash
+curl -u admin:PASSWORD -X POST \
+  http://localhost:5001/api/repositories/team-a/app/grants \
+  -H 'Content-Type: application/json' -d '{"username":"dev","role":"write"}'
+```
+
+Roles are graded: `read` pulls, `write` also pushes, `admin` also deletes and
+manages the repository's own grants. Two deliberate exceptions — a registry
+administrator is never locked out, or a mistaken grant could make a repository
+unadministrable; and a public repository stays readable, because that is what
+public means.
 
 ---
 

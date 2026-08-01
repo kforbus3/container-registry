@@ -292,6 +292,21 @@ CREATE INDEX idx_deliveries_hook ON webhook_deliveries(webhook_id, id DESC);
 -- feature is opt-in and an upgrade changes nothing.
 ALTER TABLE repositories ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0;
 `},
+
+	{"006_rbac", `
+-- Per-repository access grants. A repository with no grants keeps the previous
+-- behaviour exactly: any user who can reach it may use it. Adding the first
+-- grant locks the repository down to the people named on it, which makes this
+-- opt-in per repository rather than a registry-wide switch.
+CREATE TABLE repo_grants (
+	repo_id    INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	role       TEXT    NOT NULL,   -- read | write | admin
+	created_at TEXT    NOT NULL,
+	PRIMARY KEY(repo_id, user_id)
+);
+CREATE INDEX idx_grants_user ON repo_grants(user_id);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

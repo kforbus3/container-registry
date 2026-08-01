@@ -161,6 +161,12 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 	case actionDelete:
 		allowed = p.CanDeleteRepo(repo)
 	}
+	if allowed {
+		// Repository grants narrow access further. A repository with no grants
+		// is ungoverned and behaves exactly as before, so this only bites where
+		// somebody has deliberately locked one down.
+		allowed = s.grantAllows(r, p, repo, act)
+	}
 	if !allowed {
 		if p.IsAnonymous() {
 			s.challenge(w, "authentication required")
@@ -178,6 +184,36 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 		return
 	}
 	next(w, r)
+}
+
+// grantAllows applies per-repository access grants.
+//
+// Registry administrators are never locked out — otherwise a mistaken grant
+// could make a repository unadministrable — and a public repository stays
+// readable, because that is what public means.
+func (s *Server) grantAllows(r *http.Request, p *auth.Principal, name string, act action) bool {
+	if p.Admin {
+		return true
+	}
+	repo, err := s.DB.GetRepository(r.Context(), name)
+	if err != nil {
+		return true // nothing to govern yet
+	}
+	role, governed, err := s.DB.RepoAccess(r.Context(), repo.ID, p.UserID)
+	if err != nil || !governed {
+		return true
+	}
+	need := db.RoleRead
+	switch act {
+	case actionPush:
+		need = db.RoleWrite
+	case actionDelete:
+		need = db.RoleAdmin
+	}
+	if act == actionPull && repo.Public {
+		return true
+	}
+	return db.RoleRank(role) >= db.RoleRank(need)
 }
 
 func actionName(a action) string {
@@ -367,13 +403,27 @@ func (s *Server) resolveRef(r *http.Request, repoID int64, ref string) (string, 
 func (s *Server) getManifest(w http.ResponseWriter, r *http.Request, name, ref string) {
 	repo, err := s.DB.GetRepository(r.Context(), name)
 	if err != nil {
-		s.ociErr(w, http.StatusNotFound, codeNameUnknown, "repository not found", name)
-		return
+		// A proxied repository is created on first fetch, so a miss here is
+		// not necessarily an error.
+		if !s.tryCacheManifest(r, name, ref) {
+			s.ociErr(w, http.StatusNotFound, codeNameUnknown, "repository not found", name)
+			return
+		}
+		if repo, err = s.DB.GetRepository(r.Context(), name); err != nil {
+			s.ociErr(w, http.StatusNotFound, codeNameUnknown, "repository not found", name)
+			return
+		}
 	}
 	digest, err := s.resolveRef(r, repo.ID, ref)
 	if err != nil {
-		s.ociErr(w, http.StatusNotFound, codeManifestUnknown, "manifest unknown", ref)
-		return
+		if !s.tryCacheManifest(r, name, ref) {
+			s.ociErr(w, http.StatusNotFound, codeManifestUnknown, "manifest unknown", ref)
+			return
+		}
+		if digest, err = s.resolveRef(r, repo.ID, ref); err != nil {
+			s.ociErr(w, http.StatusNotFound, codeManifestUnknown, "manifest unknown", ref)
+			return
+		}
 	}
 	m, err := s.DB.GetManifest(r.Context(), repo.ID, digest)
 	if err != nil {
@@ -724,8 +774,11 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, name, digest
 		return
 	}
 	if !linked {
-		s.ociErr(w, http.StatusNotFound, codeBlobUnknown, "blob unknown to this repository", digest)
-		return
+		// Fill from the upstream when this repository is proxied.
+		if !s.tryCacheBlob(r, name, digest) {
+			s.ociErr(w, http.StatusNotFound, codeBlobUnknown, "blob unknown to this repository", digest)
+			return
+		}
 	}
 
 	switch r.Method {

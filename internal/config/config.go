@@ -73,6 +73,17 @@ type Config struct {
 	WebhookTimeout time.Duration
 	// MetricsToken, when set, requires a bearer token on /metrics.
 	MetricsToken string
+	// ProxyRemote, when set, turns the registry into a pull-through cache for
+	// that upstream. Repositories under ProxyPrefix are fetched on a miss.
+	ProxyRemote string
+	// ProxyPrefix scopes caching to one namespace, so a registry can hold its
+	// own images and mirror an upstream at the same time.
+	ProxyPrefix string
+	// ProxyUsername and ProxyPassword authenticate to the upstream. Anonymous
+	// pulls work but carry much lower rate limits.
+	ProxyUsername string
+	ProxyPassword string
+	ProxyTimeout  time.Duration
 }
 
 func Load() (*Config, error) {
@@ -99,6 +110,10 @@ func Load() (*Config, error) {
 		WebhookWorkers:     envInt("REGISTRY_WEBHOOK_WORKERS", 2),
 		WebhookQueue:       envInt("REGISTRY_WEBHOOK_QUEUE", 512),
 		MetricsToken:       os.Getenv("REGISTRY_METRICS_TOKEN"),
+		ProxyRemote:        env("REGISTRY_PROXY_REMOTE", ""),
+		ProxyPrefix:        env("REGISTRY_PROXY_PREFIX", "proxy"),
+		ProxyUsername:      os.Getenv("REGISTRY_PROXY_USERNAME"),
+		ProxyPassword:      os.Getenv("REGISTRY_PROXY_PASSWORD"),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -128,6 +143,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.WebhookTimeout, err = envDuration("REGISTRY_WEBHOOK_TIMEOUT", 10*time.Second); err != nil {
+		return nil, err
+	}
+	if c.ProxyTimeout, err = envDuration("REGISTRY_PROXY_TIMEOUT", 120*time.Second); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {

@@ -19,6 +19,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/config"
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
+	"github.com/kforbus3/container-registry/internal/proxy"
 	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
@@ -74,6 +75,13 @@ func run() error {
 
 	srv := api.NewServer(cfg, database, st, log)
 	srv.SetCollector(collector)
+	if cfg.ProxyRemote != "" {
+		srv.SetUpstream(proxy.NewUpstream(
+			cfg.ProxyRemote, cfg.ProxyUsername, cfg.ProxyPassword, cfg.ProxyTimeout))
+		log.Info("pull-through cache enabled",
+			"upstream", cfg.ProxyRemote, "prefix", cfg.ProxyPrefix,
+			"authenticated", cfg.ProxyUsername != "")
+	}
 	srv.SetRateLimits(
 		ratelimit.Limit{PerMinute: cfg.RateLimit, Burst: cfg.RateBurst},
 		ratelimit.Limit{PerMinute: writeLimit(cfg), Burst: cfg.RateBurst},

@@ -649,6 +649,97 @@ func validUsername(s string) bool {
 	return true
 }
 
+// ---------------------------------------------------------------- access grants
+
+// repoGrants lists or creates per-repository access grants.
+func (s *Server) repoGrants(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	p := principalFrom(r.Context())
+	switch r.Method {
+	case http.MethodGet:
+		grants, err := s.DB.RepoGrants(r.Context(), repo.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to list grants")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"grants": grants})
+
+	case http.MethodPost:
+		// Granting access is itself an administrative act on the repository.
+		if !p.Admin && !s.hasRepoRole(r, repo, db.RoleAdmin) {
+			writeErr(w, http.StatusForbidden,
+				"administrator access to this repository is required to grant it")
+			return
+		}
+		var req struct {
+			Username string `json:"username"`
+			Role     string `json:"role"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !db.ValidRole(req.Role) {
+			writeErr(w, http.StatusBadRequest, "role must be read, write or admin")
+			return
+		}
+		u, err := s.DB.GetUserByName(r.Context(), req.Username)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no such user")
+			return
+		}
+		if err := s.DB.GrantRepoAccess(r.Context(), repo.ID, u.ID, req.Role); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to grant access")
+			return
+		}
+		s.audit(r, "grant.create", repo.Name, req.Username, req.Role)
+		writeJSON(w, http.StatusCreated, map[string]string{
+			"username": req.Username, "role": req.Role,
+		})
+
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) repoGrantUser(w http.ResponseWriter, r *http.Request, repo *db.Repository, username string) {
+	if r.Method != http.MethodDelete {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	p := principalFrom(r.Context())
+	if !p.Admin && !s.hasRepoRole(r, repo, db.RoleAdmin) {
+		writeErr(w, http.StatusForbidden, "administrator access to this repository is required")
+		return
+	}
+	u, err := s.DB.GetUserByName(r.Context(), username)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such user")
+		return
+	}
+	if err := s.DB.RevokeRepoAccess(r.Context(), repo.ID, u.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to revoke access")
+		return
+	}
+	s.audit(r, "grant.revoke", repo.Name, username, "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// hasRepoRole reports whether the caller holds at least the given role on a
+// repository through a grant.
+func (s *Server) hasRepoRole(r *http.Request, repo *db.Repository, need string) bool {
+	p := principalFrom(r.Context())
+	role, governed, err := s.DB.RepoAccess(r.Context(), repo.ID, p.UserID)
+	if err != nil {
+		return false
+	}
+	if !governed {
+		// Ungoverned repositories keep the previous behaviour: anyone who can
+		// push to it may also configure it.
+		return p.CanPushRepo(repo.Name)
+	}
+	return db.RoleRank(role) >= db.RoleRank(need)
+}
+
 // ---------------------------------------------------------------- webhooks
 
 func (s *Server) handleWebhookList(w http.ResponseWriter, r *http.Request) {
@@ -783,6 +874,16 @@ func mustRetentionRules(r *http.Request, s *Server, repoID int64) []*db.Retentio
 		return []*db.RetentionRule{}
 	}
 	return rules
+}
+
+// mustRepoGrants returns a repository's access grants, or an empty list if they
+// cannot be read: the repository page should still render.
+func mustRepoGrants(r *http.Request, s *Server, repoID int64) []*db.RepoGrant {
+	grants, err := s.DB.RepoGrants(r.Context(), repoID)
+	if err != nil {
+		return []*db.RepoGrant{}
+	}
+	return grants
 }
 
 // repoRetention lists or creates retention rules for a repository.
@@ -1008,7 +1109,7 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 	verbIdx := -1
 	for i := len(segments) - 1; i > 0; i-- {
 		switch segments[i] {
-		case "tags", "manifests", "retention":
+		case "tags", "manifests", "retention", "grants":
 			verbIdx = i
 		}
 		if verbIdx >= 0 {
@@ -1049,6 +1150,10 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 		s.repoRoot(w, r, repo)
 	case len(tail) == 1 && tail[0] == "tags":
 		s.repoTags(w, r, repo)
+	case len(tail) == 1 && tail[0] == "grants":
+		s.repoGrants(w, r, repo)
+	case len(tail) == 2 && tail[0] == "grants":
+		s.repoGrantUser(w, r, repo, tail[1])
 	case len(tail) == 1 && tail[0] == "retention":
 		s.repoRetention(w, r, repo)
 	case len(tail) == 2 && tail[0] == "retention":

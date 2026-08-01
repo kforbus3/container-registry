@@ -1497,3 +1497,144 @@ func TestTagPagination(t *testing.T) {
 		t.Fatalf("search for v1 matched %d, want the ten v1x tags", found.Total)
 	}
 }
+
+// ------------------------------------------------- per-repository access grants
+
+// A repository with no grants behaves exactly as before, so adding the feature
+// changes nothing until somebody writes the first grant.
+func TestUngovernedRepositoryIsUnaffectedByRBAC(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/open", "v1")
+
+	hash, _ := auth.HashPassword("userpassword")
+	h.db.CreateUser(ctx, "dev", hash, "user")
+
+	resp := h.do(http.MethodGet, "/v2/team-a/open/manifests/v1", nil, asUser("dev", "userpassword"))
+	h.expectStatus(resp, http.StatusOK, "an ungoverned repository stays readable")
+}
+
+// The first grant locks a repository down to the people named on it.
+func TestGrantsRestrictAccess(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/locked", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/locked")
+
+	hash, _ := auth.HashPassword("userpassword")
+	insider, _ := h.db.CreateUser(ctx, "insider", hash, "user")
+	h.db.CreateUser(ctx, "outsider", hash, "user")
+
+	// Before any grant, both can read.
+	for _, who := range []string{"insider", "outsider"} {
+		resp := h.do(http.MethodGet, "/v2/team-a/locked/manifests/v1", nil, asUser(who, "userpassword"))
+		h.expectStatus(resp, http.StatusOK, who+" before any grant")
+	}
+
+	// Naming one person governs the repository and excludes everyone else.
+	if err := h.db.GrantRepoAccess(ctx, repo.ID, insider.ID, db.RoleRead); err != nil {
+		t.Fatalf("GrantRepoAccess: %v", err)
+	}
+	resp := h.do(http.MethodGet, "/v2/team-a/locked/manifests/v1", nil, asUser("insider", "userpassword"))
+	h.expectStatus(resp, http.StatusOK, "the granted user")
+
+	resp = h.do(http.MethodGet, "/v2/team-a/locked/manifests/v1", nil, asUser("outsider", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "everyone else")
+}
+
+// Read does not imply write, and write does not imply delete.
+func TestGrantRolesAreGraded(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/graded", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/graded")
+
+	hash, _ := auth.HashPassword("userpassword")
+	reader, _ := h.db.CreateUser(ctx, "reader", hash, "user")
+	writer, _ := h.db.CreateUser(ctx, "writer", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, reader.ID, db.RoleRead)
+	h.db.GrantRepoAccess(ctx, repo.ID, writer.ID, db.RoleWrite)
+
+	// A reader may read but not push.
+	resp := h.do(http.MethodGet, "/v2/team-a/graded/manifests/v1", nil, asUser("reader", "userpassword"))
+	h.expectStatus(resp, http.StatusOK, "reader reads")
+	resp = h.do(http.MethodPost, "/v2/team-a/graded/blobs/uploads/", nil, asUser("reader", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "reader must not push")
+
+	// A writer may push but not delete.
+	resp = h.do(http.MethodPost, "/v2/team-a/graded/blobs/uploads/", nil, asUser("writer", "userpassword"))
+	h.expectStatus(resp, http.StatusAccepted, "writer pushes")
+	resp = h.do(http.MethodDelete, "/v2/team-a/graded/manifests/v1", nil, asUser("writer", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "writer must not delete")
+}
+
+// A registry administrator is never locked out, or a mistaken grant could make
+// a repository unadministrable.
+func TestAdminBypassesGrants(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/locked", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/locked")
+
+	hash, _ := auth.HashPassword("userpassword")
+	other, _ := h.db.CreateUser(ctx, "someone", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, other.ID, db.RoleRead)
+
+	// The admin was never granted anything and still has full access.
+	resp := h.do(http.MethodGet, "/v2/team-a/locked/manifests/v1", nil)
+	h.expectStatus(resp, http.StatusOK, "admin reads")
+	resp = h.do(http.MethodDelete, "/v2/team-a/locked/manifests/v1", nil)
+	h.expectStatus(resp, http.StatusAccepted, "admin deletes")
+}
+
+// A public repository stays readable, because that is what public means.
+func TestPublicRepositoryStaysReadableDespiteGrants(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/pub", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/pub")
+	h.db.UpdateRepository(ctx, repo.ID, true, false, "")
+
+	hash, _ := auth.HashPassword("userpassword")
+	insider, _ := h.db.CreateUser(ctx, "insider", hash, "user")
+	h.db.CreateUser(ctx, "outsider", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, insider.ID, db.RoleWrite)
+
+	resp := h.do(http.MethodGet, "/v2/team-a/pub/manifests/v1", nil, asUser("outsider", "userpassword"))
+	h.expectStatus(resp, http.StatusOK, "a public repository is readable by anyone")
+
+	// But still not writable by them.
+	resp = h.do(http.MethodPost, "/v2/team-a/pub/blobs/uploads/", nil, asUser("outsider", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "public does not mean writable")
+}
+
+func TestGrantAPI(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/api", "v1")
+	hash, _ := auth.HashPassword("userpassword")
+	h.db.CreateUser(ctx, "dev", hash, "user")
+
+	body, _ := json.Marshal(map[string]string{"username": "dev", "role": "write"})
+	resp := h.do(http.MethodPost, "/api/repositories/team-a/api/grants", body)
+	h.expectStatus(resp, http.StatusCreated, "grant access")
+
+	var listed struct {
+		Grants []struct {
+			Username string `json:"username"`
+			Role     string `json:"role"`
+		} `json:"grants"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories/team-a/api/grants", nil), http.StatusOK, &listed)
+	if len(listed.Grants) != 1 || listed.Grants[0].Username != "dev" || listed.Grants[0].Role != "write" {
+		t.Fatalf("grants = %+v", listed.Grants)
+	}
+
+	// An unknown role is rejected rather than silently stored.
+	body, _ = json.Marshal(map[string]string{"username": "dev", "role": "superuser"})
+	resp = h.do(http.MethodPost, "/api/repositories/team-a/api/grants", body)
+	h.expectStatus(resp, http.StatusBadRequest, "invalid role")
+
+	resp = h.do(http.MethodDelete, "/api/repositories/team-a/api/grants/dev", nil)
+	h.expectStatus(resp, http.StatusOK, "revoke")
+}

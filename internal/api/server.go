@@ -21,6 +21,7 @@ import (
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/gc"
 	"github.com/kforbus3/container-registry/internal/metrics"
+	"github.com/kforbus3/container-registry/internal/proxy"
 	"github.com/kforbus3/container-registry/internal/ratelimit"
 	"github.com/kforbus3/container-registry/internal/sbom"
 	"github.com/kforbus3/container-registry/internal/store"
@@ -47,6 +48,31 @@ type Server struct {
 	writes  *ratelimit.Limiter
 	hooks   *webhook.Dispatcher
 	Metrics *metrics.Registry
+
+	upstream *proxy.Upstream
+}
+
+// SetUpstream turns the registry into a pull-through cache for a remote.
+func (s *Server) SetUpstream(u *proxy.Upstream) { s.upstream = u }
+
+// proxyRepo reports the upstream repository name for a local one, and whether
+// this repository is proxied at all.
+//
+// Caching is scoped to a prefix so one registry can hold its own images and
+// mirror an upstream at the same time: "proxy/library/alpine" is fetched from
+// upstream as "library/alpine", while "team-a/app" is purely local.
+func (s *Server) proxyRepo(name string) (string, bool) {
+	if s.upstream == nil {
+		return "", false
+	}
+	prefix := strings.Trim(s.Cfg.ProxyPrefix, "/")
+	if prefix == "" {
+		return name, true // the whole registry mirrors upstream
+	}
+	if name == prefix || !strings.HasPrefix(name, prefix+"/") {
+		return "", false
+	}
+	return strings.TrimPrefix(name, prefix+"/"), true
 }
 
 // SetRateLimits installs per-caller limits. Writes are limited separately
