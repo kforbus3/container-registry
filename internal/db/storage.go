@@ -198,6 +198,29 @@ func (d *DB) RepoBlobDigests(ctx context.Context, repoID int64) ([]string, error
 	return out, rows.Err()
 }
 
+// BackfillRepoStorage records a placement for repositories that have content
+// but no record of where it is.
+//
+// Every repository that existed before routing was added is in this state, and
+// leaving it there is a trap: with no placement recorded, a rule added later
+// would treat the repository as new and send its reads to a bucket its bytes
+// were never written to. Before routing existed there was exactly one backend,
+// so that is where their content is.
+func (d *DB) BackfillRepoStorage(ctx context.Context, backend string) (int64, error) {
+	res, err := d.ExecContext(ctx, `
+		INSERT INTO repository_storage (repo_id, backend, updated_at)
+		SELECT rep.id, ?, ?
+		  FROM repositories rep
+		 WHERE rep.id NOT IN (SELECT repo_id FROM repository_storage)
+		   AND (EXISTS (SELECT 1 FROM blobs b WHERE b.repo_id = rep.id)
+		     OR EXISTS (SELECT 1 FROM manifests m WHERE m.repo_id = rep.id))`,
+		backend, nowStr())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // MisplacedRepos lists repositories whose recorded storage differs from what
 // the rules would choose now, which is exactly the set needing a migration.
 func (d *DB) MisplacedRepos(ctx context.Context, resolve func(string) string) ([]string, error) {
