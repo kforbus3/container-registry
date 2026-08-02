@@ -20,6 +20,10 @@ import (
 // depending on who happened to push them -- and the residency boundary would
 // track people rather than content, which is the opposite of what it is for.
 
+// DefaultBackend is the name a rule uses to mean the fallback backend, which
+// has no entry of its own in the backend map.
+const DefaultBackend = "default"
+
 // Rule maps a repository name pattern onto a backend. Rules are ordered and the
 // first match wins, so specific patterns are placed above general ones.
 type Rule struct {
@@ -171,6 +175,12 @@ func (r *Router) target(repo string) (Backend, string) {
 	for _, rule := range r.rules {
 		if !matchPattern(rule.Pattern, repo) {
 			continue
+		}
+		// A rule may name the default explicitly, which is how a namespace is
+		// sent back to local storage while a broader rule still routes its
+		// siblings elsewhere.
+		if rule.Backend == DefaultBackend {
+			return r.fallback, rule.Pattern
 		}
 		if b, ok := r.backends[rule.Backend]; ok && b != nil {
 			return b, rule.Pattern

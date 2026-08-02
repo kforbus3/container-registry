@@ -15,6 +15,11 @@ type StorageBackend struct {
 	Config string `json:"-"` // holds a sealed credential; never serialised out
 }
 
+// DefaultBackendName is how a rule refers to the fallback backend, which has no
+// row of its own: it comes from the environment or the default storage setting
+// rather than being registered like the others.
+const DefaultBackendName = "default"
+
 // StorageRule maps a repository name pattern onto a backend.
 type StorageRule struct {
 	ID       int64  `json:"id"`
@@ -88,9 +93,9 @@ func (d *DB) DeleteStorageBackend(ctx context.Context, name string) error {
 // ListStorageRules returns the rules in evaluation order.
 func (d *DB) ListStorageRules(ctx context.Context) ([]StorageRule, error) {
 	rows, err := d.QueryContext(ctx, `
-		SELECT r.id, r.pattern, b.name, r.priority
-		  FROM storage_rules r JOIN storage_backends b ON b.id = r.backend_id
-		 ORDER BY r.priority, r.id`)
+		SELECT r.id, r.pattern, COALESCE(b.name, ?), r.priority
+		  FROM storage_rules r LEFT JOIN storage_backends b ON b.id = r.backend_id
+		 ORDER BY r.priority, r.id`, DefaultBackendName)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +114,15 @@ func (d *DB) ListStorageRules(ctx context.Context) ([]StorageRule, error) {
 func (d *DB) AddStorageRule(ctx context.Context, pattern, backend string, priority int) error {
 	if strings.TrimSpace(pattern) == "" {
 		return fmt.Errorf("a rule needs a pattern")
+	}
+	// A rule targeting the default backend stores no reference, because the
+	// default has no row: it comes from the environment or the default storage
+	// setting rather than from the backend table.
+	if backend == "" || backend == DefaultBackendName {
+		_, err := d.ExecContext(ctx,
+			`INSERT INTO storage_rules (pattern, backend_id, priority, created_at) VALUES (?,NULL,?,?)`,
+			strings.TrimSpace(pattern), priority, nowStr())
+		return err
 	}
 	b, err := d.GetStorageBackend(ctx, backend)
 	if err != nil {

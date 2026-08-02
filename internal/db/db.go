@@ -354,6 +354,29 @@ CREATE TABLE repository_storage (
 	updated_at TEXT    NOT NULL
 );
 `},
+
+	{"010_rules_may_target_default", `
+-- A rule could only name a configured backend, so there was no way to say "this
+-- namespace belongs on local disk" while a broader rule sent it to S3. Moving a
+-- repository back meant deleting or narrowing the rule that sent it away, which
+-- is a blunt instrument when that rule is still right for everything else.
+--
+-- A NULL backend_id now means the default backend. SQLite cannot drop a NOT
+-- NULL constraint in place, so the table is rebuilt; the index belongs to the
+-- dropped table and is recreated with it.
+CREATE TABLE storage_rules_new (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	pattern    TEXT    NOT NULL,
+	backend_id INTEGER REFERENCES storage_backends(id) ON DELETE CASCADE,
+	priority   INTEGER NOT NULL DEFAULT 100,
+	created_at TEXT    NOT NULL
+);
+INSERT INTO storage_rules_new (id, pattern, backend_id, priority, created_at)
+	SELECT id, pattern, backend_id, priority, created_at FROM storage_rules;
+DROP TABLE storage_rules;
+ALTER TABLE storage_rules_new RENAME TO storage_rules;
+CREATE INDEX idx_storage_rules_priority ON storage_rules(priority);
+`},
 }
 
 func (d *DB) migrate(ctx context.Context) error {

@@ -337,6 +337,13 @@ func (s *Server) routingView(ctx context.Context) map[string]any {
 	if rules == nil {
 		rules = []db.StorageRule{}
 	}
+	// The default is offered alongside the named backends so a rule can send a
+	// namespace back to local storage without deleting the rule that sent its
+	// siblings away.
+	names = append(names, map[string]any{
+		"name": db.DefaultBackendName, "kind": "default",
+		"bucket": "", "endpoint": s.Store.Router().Fallback().Name(), "healthy": true,
+	})
 	return map[string]any{
 		"rules":     rules,
 		"backends":  names,
