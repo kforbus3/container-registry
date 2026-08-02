@@ -38,6 +38,7 @@ type Server struct {
 	Auth  *auth.Authenticator
 	Log   *slog.Logger
 
+	batch     *batchMigration
 	collector *gc.Collector
 	sbom      *sbom.Generator
 	vuln      *vuln.Scanner
@@ -139,7 +140,7 @@ func NewServer(cfg *config.Config, database *db.DB, st *store.Store, log *slog.L
 	}
 	return &Server{
 		Cfg: cfg, DB: database, Store: st, Auth: auth.New(database), Log: log,
-		Metrics: metrics.New(), tokenSecret: secret,
+		Metrics: metrics.New(), tokenSecret: secret, batch: &batchMigration{},
 	}
 }
 

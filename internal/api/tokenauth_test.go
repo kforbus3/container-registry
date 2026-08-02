@@ -56,3 +56,42 @@ func TestTokenRealmIsAbsolute(t *testing.T) {
 		})
 	}
 }
+
+// TestBatchResetKeepsItsMutex is the regression test for a crash. Starting a
+// bulk move reset its state by assigning a fresh struct over the one whose
+// mutex was held, which replaced that mutex and made the following unlock a
+// fatal error -- taking the whole registry down rather than failing the request.
+func TestBatchResetKeepsItsMutex(t *testing.T) {
+	b := &batchMigration{}
+
+	start := func(n int) bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.running {
+			return false
+		}
+		b.running = true
+		b.total = n
+		b.done = 0
+		b.failures = nil
+		return true
+	}
+
+	if !start(3) {
+		t.Fatal("first start refused")
+	}
+	// The second call has to take the same lock. If the reset had replaced it,
+	// this is where the process would have died.
+	if start(5) {
+		t.Error("a second bulk move started while one was running")
+	}
+	b.mu.Lock()
+	b.running = false
+	b.mu.Unlock()
+	if !start(2) {
+		t.Error("could not start once the previous run finished")
+	}
+	if got := b.snapshot()["total"]; got != 2 {
+		t.Errorf("total = %v, want 2", got)
+	}
+}
