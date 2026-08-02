@@ -717,6 +717,15 @@ it: events are queued, and a saturated queue drops them and counts the drops.
 
 ---
 
+## How it compares to Harbor and Zot
+
+[`docs/COMPARISON.md`](docs/COMPARISON.md) is a candid comparison against the two
+open-source registries most often chosen for self-hosting — including where this
+one loses, which is mostly high availability, replication and identity
+integration.
+
+---
+
 ## Storage routing
 
 One registry can store blobs in several places, chosen by the repository they
