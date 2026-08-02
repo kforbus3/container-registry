@@ -3,6 +3,7 @@ package sbom
 import (
 	"bytes"
 	"debug/buildinfo"
+	"io"
 	"strings"
 )
 
@@ -105,7 +106,22 @@ func parseDpkg(db []byte) []pkg {
 // built FROM scratch or distroless carry no package database at all, so this is
 // often the only source of component data for them.
 func parseGoBinary(path string, content []byte) []pkg {
-	info, err := buildinfo.Read(bytes.NewReader(content))
+	return goPackagesFrom(path, bytes.NewReader(content))
+}
+
+// parseGoBinaryAt reads build info from an executable however it was buffered,
+// in memory or spilled to a temporary file.
+func parseGoBinaryAt(e executable) []pkg {
+	r, _, closer, err := e.open()
+	if err != nil {
+		return nil
+	}
+	defer closer()
+	return goPackagesFrom(e.path, r)
+}
+
+func goPackagesFrom(path string, r io.ReaderAt) []pkg {
+	info, err := buildinfo.Read(r)
 	if err != nil {
 		return nil
 	}

@@ -81,7 +81,7 @@ type pkg struct {
 	Arch      string
 	Epoch     string // RPM only, and only when non-zero
 	License   string
-	Ecosystem string // apk | deb | rpm | npm | pypi | golang
+	Ecosystem string // apk | deb | rpm | npm | pypi | golang | maven | gem | nuget | composer
 	Source    string // the file the package was discovered in
 	Path      string // where in the image the file lived
 }
@@ -133,6 +133,23 @@ func (p pkg) purl(distro string) string {
 		return fmt.Sprintf("pkg:pypi/%s@%s", p.Name, p.Version)
 	case "golang":
 		return fmt.Sprintf("pkg:golang/%s@%s", p.Name, p.Version)
+	case "maven":
+		// Maven coordinates are group:artifact; purl separates them with a
+		// slash, and an artifact with no group keeps the bare name.
+		if g, a, ok := strings.Cut(p.Name, ":"); ok {
+			return fmt.Sprintf("pkg:maven/%s/%s@%s", g, a, p.Version)
+		}
+		return fmt.Sprintf("pkg:maven/%s@%s", p.Name, p.Version)
+	case "gem":
+		return fmt.Sprintf("pkg:gem/%s@%s", p.Name, p.Version)
+	case "nuget":
+		return fmt.Sprintf("pkg:nuget/%s@%s", p.Name, p.Version)
+	case "composer":
+		return fmt.Sprintf("pkg:composer/%s@%s", p.Name, p.Version)
+	case "python", "node":
+		// A runtime built into the image rather than installed as a package.
+		// Both are indexed by OSV under these names.
+		return fmt.Sprintf("pkg:generic/%s@%s", p.Name, p.Version)
 	}
 	return ""
 }
