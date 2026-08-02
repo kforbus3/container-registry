@@ -38,6 +38,9 @@ type Router struct {
 	// placements records where each repository's blobs actually are, which is
 	// not always where the rules now say they belong.
 	placements map[string]string
+	// mirrors holds, per repository, a second backend that writes are copied
+	// to while that repository is being migrated.
+	mirrors map[string]Backend
 	// fallbackName is what the default backend is called in the UI and logs.
 	fallbackName string
 }
@@ -48,6 +51,7 @@ func NewRouter(fallback Backend) *Router {
 	return &Router{
 		backends:     map[string]Backend{},
 		placements:   map[string]string{},
+		mirrors:      map[string]Backend{},
 		fallback:     fallback,
 		fallbackName: "default",
 	}
@@ -99,6 +103,31 @@ func (r *Router) Placement(repo string) (string, bool) {
 	defer r.mu.RUnlock()
 	b, ok := r.placements[repo]
 	return b, ok
+}
+
+// SetMirror starts copying one repository's writes to a second backend, which
+// is what keeps a push landing mid-migration from being lost at the switch.
+func (r *Router) SetMirror(repo string, b Backend) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mirrors == nil {
+		r.mirrors = map[string]Backend{}
+	}
+	r.mirrors[repo] = b
+}
+
+// ClearMirror stops mirroring a repository's writes.
+func (r *Router) ClearMirror(repo string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.mirrors, repo)
+}
+
+// Mirror returns the backend a repository's writes are being copied to, if any.
+func (r *Router) Mirror(repo string) Backend {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mirrors[repo]
 }
 
 // Resolve reports which backend a repository's blobs are read from and written

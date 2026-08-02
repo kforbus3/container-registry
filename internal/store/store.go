@@ -476,7 +476,7 @@ func (s *Store) commitTo(rs *RepoStore, id, expectedDigest string) (int64, error
 	if err != nil {
 		return 0, err
 	}
-	err = s.putTo(context.Background(), backend, key, f, st.Offset)
+	err = rs.put(context.Background(), backend, key, f, st.Offset)
 	f.Close()
 	if err != nil {
 		return 0, err

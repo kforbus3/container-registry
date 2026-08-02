@@ -1204,7 +1204,7 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 	verbIdx := -1
 	for i := len(segments) - 1; i > 0; i-- {
 		switch segments[i] {
-		case "tags", "manifests", "retention", "grants":
+		case "tags", "manifests", "retention", "grants", "migrate":
 			verbIdx = i
 		}
 		if verbIdx >= 0 {
@@ -1249,6 +1249,8 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 		s.repoGrants(w, r, repo)
 	case len(tail) == 2 && tail[0] == "grants":
 		s.repoGrantUser(w, r, repo, tail[1])
+	case len(tail) == 1 && tail[0] == "migrate":
+		s.handleRepoMigrate(w, r, repo)
 	case len(tail) == 1 && tail[0] == "retention":
 		s.repoRetention(w, r, repo)
 	case len(tail) == 2 && tail[0] == "retention":

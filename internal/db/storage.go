@@ -175,6 +175,29 @@ func (d *DB) AllRepoStorage(ctx context.Context) (map[string]string, error) {
 	return out, rows.Err()
 }
 
+// RepoBlobDigests lists every blob a repository references, which is the exact
+// set a per-repository migration has to carry across. Manifests are stored as
+// blobs too, so they come along with the layers.
+func (d *DB) RepoBlobDigests(ctx context.Context, repoID int64) ([]string, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT digest FROM blobs WHERE repo_id = ?
+		UNION
+		SELECT digest FROM manifests WHERE repo_id = ?`, repoID, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // MisplacedRepos lists repositories whose recorded storage differs from what
 // the rules would choose now, which is exactly the set needing a migration.
 func (d *DB) MisplacedRepos(ctx context.Context, resolve func(string) string) ([]string, error) {
