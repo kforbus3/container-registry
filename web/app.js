@@ -653,6 +653,45 @@ function bindRepoFilter(all, prefix) {
   });
 }
 
+/** Where this repository's blobs actually live.
+ *
+ *  With several backends configured, two repositories side by side can be in
+ *  different buckets, and nothing else on the page reveals which. */
+function repoStorageHTML(name, st) {
+  if (!st.backend && !st.error) return '';
+  if (st.error) {
+    return `<div class="card">
+      <h2>Blob storage <span class="badge danger">unavailable</span></h2>
+      <p class="muted small">${esc(st.error)}. Pulls from this repository will
+        fail until that backend is configured again.</p>
+    </div>`;
+  }
+  const rule = st.rule ? `matched by <code>${esc(st.rule)}</code>` : 'no rule matches, so the default applies';
+  if (!st.misplaced) {
+    return `<div class="card">
+      <h2>Blob storage</h2>
+      <dl class="kv">
+        <dt>Backend</dt><dd class="mono">${esc(st.backend)}</dd>
+        <dt>Rule</dt><dd class="muted small">${rule}</dd>
+      </dl>
+    </div>`;
+  }
+  return `<div class="card">
+    <h2>Blob storage <span class="badge warn">not where the rules say</span></h2>
+    <dl class="kv">
+      <dt>Currently in</dt><dd class="mono">${esc(st.backend)}</dd>
+      <dt>Should be in</dt><dd class="mono">${esc(st.target || '')}</dd>
+      <dt>Rule</dt><dd class="muted small">${rule}</dd>
+    </dl>
+    <p class="muted small" style="margin-top:.7rem">Pulls and pushes keep working
+      from where the blobs are. Moving them copies and verifies every blob before
+      anything switches.</p>
+    <div class="row" style="margin-top:.8rem">
+      <button class="btn" onclick="migrateRepo('${jsq(name)}',this)">Move to ${esc(st.target || '')}</button>
+    </div>
+  </div>`;
+}
+
 // ---- repository detail
 
 const TAG_PAGE_SIZE = 25;
@@ -720,6 +759,7 @@ async function renderRepo(view, [name, offsetArg, searchArg]) {
       ${stat('Storage', bytes(data.used_bytes || 0),
         repo.quota_bytes ? `of ${bytes(repo.quota_bytes)} quota` : 'no quota')}
     </div>
+    ${repoStorageHTML(repo.name, data.storage || {})}
 
     <div class="card">
       <h2>Tags <span class="badge">${totalTags}</span></h2>
@@ -1384,6 +1424,27 @@ function storageFormHTML(st) {
 }
 
 /** Progress and controls for a migration between backends. */
+/** Progress for a bulk move, shown above the per-repository progress. */
+function batchMigrationHTML(b) {
+  if (!b || !b.running) {
+    if (b && b.failures && b.failures.length) {
+      return `<div class="card" style="margin-top:1rem;background:var(--bg)">
+        <h3>Bulk move finished with errors</h3>
+        <p class="muted small">${b.done} of ${b.total} attempted;
+          ${b.failures.length} failed and were left where they were:</p>
+        <p class="mono small">${b.failures.slice(0, 8).map(esc).join('<br>')}</p>
+      </div>`;
+    }
+    return '';
+  }
+  const pct = b.total ? Math.round((b.done / b.total) * 100) : 0;
+  return `<div class="card" style="margin-top:1rem;background:var(--bg)">
+    <h3>Moving repositories <span class="badge warn">${b.done} of ${b.total}</span></h3>
+    <p class="muted small">${pct}% — currently <code>${esc(b.current || '')}</code>.
+      They run one at a time; pushes keep working throughout.</p>
+  </div>`;
+}
+
 function storageMigrationHTML(m) {
   if (!m || (!m.running && !m.started_at)) return '';
   const pct = m.bytes_total ? Math.round((m.bytes_done / m.bytes_total) * 100) : 0;
@@ -1602,6 +1663,9 @@ function rulesCard(routing) {
         and pushes carry on working. New repositories matching the rule go
         straight to the new backend. Moving the existing ones is a
         per-repository migration.</p>
+      <div class="row" style="margin-top:.8rem">
+        <button class="btn primary" onclick="migrateAll(this)">Move all ${misplaced.length}</button>
+      </div>
     </div>` : ''}
     <div class="row" style="margin-top:.8rem">
       <button class="btn" onclick="addStorageRule()"
@@ -1774,6 +1838,42 @@ window.migrateRepo = async (name, btn) => {
   }
 };
 
+window.migrateAll = async (btn) => {
+  if (!await confirmDanger('Move every misplaced repository?',
+    'Each is copied and verified in turn, then starts reading from its new ' +
+    'backend. They run one at a time rather than together, so this takes as ' +
+    'long as the total content requires. Pushes keep working, and a repository ' +
+    'that fails is reported without stopping the rest.', 'Move all')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  try {
+    await api('/storage/migrate-all', { method: 'POST' });
+  } catch (ex) {
+    toast(ex.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Move all'; }
+    return;
+  }
+  toast('Moving repositories', 'success');
+  pollBatch();
+};
+
+/** Follow a bulk move to completion, redrawing as each repository finishes. */
+async function pollBatch() {
+  const deadline = Date.now() + 6 * 3600 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let b;
+    try { b = await api('/storage/migrate-all'); } catch { return; }
+    if (!b.running) {
+      const failed = (b.failures || []).length;
+      toast(failed ? `${b.done - failed} moved, ${failed} failed` : `Moved ${b.done} repositories`,
+        failed ? 'error' : 'success');
+      route();
+      return;
+    }
+    if (location.hash.startsWith('#/maintenance')) route();
+  }
+}
+
 window.moveStorageRule = async (id, priority) => {
   try {
     await api(`/storage/rules/${id}`, {
@@ -1837,6 +1937,7 @@ async function renderMaintenance(view) {
         Storage is set by the environment (<code>REGISTRY_S3_BUCKET</code> and
         friends), which takes precedence over anything configured here. Unset
         those variables to manage storage from this page.</p>` : ''}
+      ${batchMigrationHTML(settings.batch || {})}
       ${storageMigrationHTML(st.migration || {})}
       <div id="storage-form" hidden style="margin-top:1rem">
         ${storageFormHTML(st)}

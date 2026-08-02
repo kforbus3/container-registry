@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/kforbus3/container-registry/internal/db"
 	"github.com/kforbus3/container-registry/internal/store"
@@ -389,4 +391,178 @@ func (s *Server) handleRepoMigrate(w http.ResponseWriter, r *http.Request, repo 
 		"to":         target.Name(),
 		"blobs":      len(digests),
 	})
+}
+
+// repoStorageView reports where one repository's blobs are, where the rules say
+// they belong, and the rule that decided it.
+//
+// A registry with several backends makes "where does this actually live" a
+// real question, and the answer is not derivable from anything else on the
+// page: two repositories side by side can be in different buckets.
+func (s *Server) repoStorageView(repo string) map[string]any {
+	router := s.Store.Router()
+	actual, why := router.Resolve(repo)
+	target, rule := router.Target(repo)
+
+	out := map[string]any{"rule": rule}
+	if actual != nil {
+		out["backend"] = actual.Name()
+	} else {
+		// The recorded placement names a backend that is not configured, so the
+		// bytes are not readable from anywhere this registry knows about.
+		out["backend"] = ""
+		out["error"] = "this repository's blobs were written to " +
+			strings.TrimPrefix(why, "placed:") + ", which is not configured"
+	}
+	if target != nil {
+		out["target"] = target.Name()
+	}
+	// Misplaced only means the rules changed after the content was written.
+	// Pulls keep working; it is a migration waiting to happen, not a fault.
+	out["misplaced"] = actual != nil && target != nil && actual.Name() != target.Name()
+	if rule == "" || why == "placed" {
+		out["rule"] = ruleFor(router, repo)
+	}
+	return out
+}
+
+// ruleFor names the rule that would place a repository, for display.
+func ruleFor(router *store.Router, repo string) string {
+	_, rule := router.Target(repo)
+	return rule
+}
+
+// ---------------------------------------------------------------- move all
+
+// batchMigration tracks moving every misplaced repository, one after another.
+//
+// Migrations run one at a time by design -- two copies competing for the same
+// backend help nobody -- so a batch is a queue rather than a fan-out. Its state
+// is separate from the per-repository progress so the UI can show both "3 of 8
+// repositories" and how far the current one has got.
+type batchMigration struct {
+	mu        sync.Mutex
+	running   bool
+	total     int
+	done      int
+	current   string
+	failures  []string
+	startedAt time.Time
+	endedAt   time.Time
+}
+
+func (b *batchMigration) snapshot() map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]any{
+		"running": b.running, "total": b.total, "done": b.done,
+		"current": b.current, "failures": b.failures,
+	}
+	if !b.startedAt.IsZero() {
+		out["started_at"] = b.startedAt
+	}
+	if !b.endedAt.IsZero() {
+		out["ended_at"] = b.endedAt
+	}
+	return out
+}
+
+// handleMigrateAll moves every misplaced repository to where its rule points.
+func (s *Server) handleMigrateAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, s.batch.snapshot())
+		return
+	}
+	if envManaged() {
+		writeErr(w, http.StatusConflict, "storage is configured by the environment")
+		return
+	}
+	repos := s.misplaced(r.Context())
+	if len(repos) == 0 {
+		writeErr(w, http.StatusBadRequest, "every repository is already where the rules say")
+		return
+	}
+
+	s.batch.mu.Lock()
+	if s.batch.running {
+		s.batch.mu.Unlock()
+		writeErr(w, http.StatusConflict, "a bulk move is already running")
+		return
+	}
+	// Fields are reset individually. Assigning a fresh struct over *s.batch
+	// would replace the mutex currently held with a zero-valued one, and the
+	// Unlock below would then be unlocking a lock nobody holds -- which is a
+	// fatal error in Go, not a recoverable panic, so it takes the registry down.
+	s.batch.running = true
+	s.batch.total = len(repos)
+	s.batch.done = 0
+	s.batch.current = ""
+	s.batch.failures = nil
+	s.batch.startedAt = time.Now()
+	s.batch.endedAt = time.Time{}
+	s.batch.mu.Unlock()
+
+	s.audit(r, "storage.migrate.all", "", "", fmt.Sprintf("%d repositories", len(repos)))
+	go s.runBatch(repos)
+	writeJSON(w, http.StatusAccepted, s.batch.snapshot())
+}
+
+// runBatch moves each repository in turn, carrying on past one that fails.
+//
+// A single failure must not strand the rest: the repositories are independent,
+// and stopping would leave an operator to work out which of eight were done.
+func (s *Server) runBatch(repos []string) {
+	ctx := context.Background()
+	for _, name := range repos {
+		s.batch.mu.Lock()
+		s.batch.current = name
+		s.batch.mu.Unlock()
+
+		if err := s.migrateOne(ctx, name); err != nil {
+			s.Log.Error("bulk move: repository failed", "repo", name, "err", err)
+			s.batch.mu.Lock()
+			s.batch.failures = append(s.batch.failures, name+": "+err.Error())
+			s.batch.mu.Unlock()
+		}
+		s.batch.mu.Lock()
+		s.batch.done++
+		s.batch.mu.Unlock()
+	}
+	s.batch.mu.Lock()
+	s.batch.running = false
+	s.batch.current = ""
+	s.batch.endedAt = time.Now()
+	s.batch.mu.Unlock()
+	s.Log.Info("bulk storage move finished", "repositories", len(repos))
+}
+
+// migrateOne moves a single repository and waits for it to finish, which is
+// what makes the batch sequential.
+func (s *Server) migrateOne(ctx context.Context, name string) error {
+	repo, err := s.DB.GetRepository(ctx, name)
+	if err != nil {
+		return err
+	}
+	target, rule := s.Store.Router().Target(name)
+	if target == nil {
+		return fmt.Errorf("rule %q names a backend that is not configured", rule)
+	}
+	digests, err := s.DB.RepoBlobDigests(ctx, repo.ID)
+	if err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	if err := s.Store.MigrateRepo(ctx, name, target, digests, func(err error) {
+		done <- err
+	}); err != nil {
+		return err
+	}
+	if err := <-done; err != nil {
+		return err
+	}
+	if err := s.DB.RecordRepoStorage(ctx, repo.ID, target.Name()); err != nil {
+		return fmt.Errorf("moved, but the new location was not recorded: %w", err)
+	}
+	s.Store.Router().SetPlacement(name, target.Name())
+	return nil
 }

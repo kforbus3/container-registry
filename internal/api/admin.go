@@ -66,6 +66,8 @@ func (s *Server) adminRouter() http.Handler {
 	mux.Handle("POST /storage/check", s.requireAdmin(s.handleStorageCheck))
 	mux.Handle("PUT /storage", s.requireAdmin(s.handleStorageSave))
 	mux.Handle("POST /storage/migrate", s.requireAdmin(s.handleStorageMigrate))
+	mux.Handle("POST /storage/migrate-all", s.requireAdmin(s.handleMigrateAll))
+	mux.Handle("GET /storage/migrate-all", s.requireAdmin(s.handleMigrateAll))
 	mux.Handle("GET /storage/backends", s.requireAdmin(s.handleStorageBackends))
 	mux.Handle("POST /storage/backends", s.requireAdmin(s.handleStorageBackends))
 	mux.Handle("DELETE /storage/backends/{name}", s.requireAdmin(s.handleStorageBackend))
@@ -1148,6 +1150,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"session_ttl":          s.Cfg.SessionTTL.String(),
 		"storage":              s.storageView(),
 		"routing":              s.routingView(r.Context()),
+		"batch":                s.batch.snapshot(),
 		"gc_grace":             s.collector.Grace.String(),
 		"gc_upload_ttl":        s.collector.UploadTTL.String(),
 		"maintenance_interval": s.Cfg.MaintenanceInterval.String(),
@@ -1313,6 +1316,7 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"repository":         repo,
+			"storage":            s.repoStorageView(repo.Name),
 			"tags":               tags,
 			"manifests":          manifests,
 			"untagged_manifests": untagged,
