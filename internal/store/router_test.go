@@ -160,3 +160,36 @@ func TestPlacementToMissingBackendFails(t *testing.T) {
 		t.Errorf("reason %q does not say where it was placed", why)
 	}
 }
+
+// TestRuleCanTargetDefault covers sending a namespace back to local storage
+// while a broader rule still routes its siblings elsewhere. Without it the only
+// way back was to delete or narrow the broader rule, which is a blunt
+// instrument when that rule is still right for everything else.
+func TestRuleCanTargetDefault(t *testing.T) {
+	def := namedBackend(t, "default")
+	remote := namedBackend(t, "remote")
+	r := NewRouter(def)
+	r.Replace([]Rule{
+		{Pattern: "demo/keep-*", Backend: DefaultBackend, Priority: 10},
+		{Pattern: "demo/*", Backend: "remote", Priority: 20},
+	}, map[string]Backend{"remote": remote})
+
+	if b, rule := r.Target("demo/keep-local"); b != def || rule != "demo/keep-*" {
+		t.Errorf("demo/keep-local -> %s via %q, want the default", name(b), rule)
+	}
+	if b, _ := r.Target("demo/other"); b != remote {
+		t.Errorf("demo/other -> %s, want remote", name(b))
+	}
+
+	// And it is what marks a repository already in the remote backend as
+	// needing to come home.
+	r.SetPlacement("demo/keep-local", remote.Name())
+	actual, _ := r.Resolve("demo/keep-local")
+	target, _ := r.Target("demo/keep-local")
+	if actual != remote {
+		t.Errorf("reads should still come from %s until it is moved", name(remote))
+	}
+	if target != def {
+		t.Errorf("target should be the default, got %s", name(target))
+	}
+}

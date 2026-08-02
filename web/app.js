@@ -1621,7 +1621,9 @@ function rulesCard(routing) {
   const rows = rules.map((r, i) => `<tr>
     <td class="num muted">${r.priority}</td>
     <td class="mono">${esc(r.pattern)}</td>
-    <td>${esc(r.backend)}</td>
+    <td>${r.backend === 'default'
+      ? `default <span class="muted small">(${esc(routing.default || '')})</span>`
+      : esc(r.backend)}</td>
     <td class="actions">
       ${i > 0 ? `<button class="btn ghost small" title="Evaluate earlier"
         onclick="moveStorageRule(${r.id},${r.priority - 15})">↑</button>` : ''}
@@ -1643,7 +1645,10 @@ function rulesCard(routing) {
     <p class="muted small" style="margin-top:-.4rem">
       Checked in order; the first pattern that matches a repository name decides
       where its blobs go. <code>*</code> matches any run of characters including
-      <code>/</code>, so <code>gov/*</code> covers <code>gov/team/app</code>.</p>
+      <code>/</code>, so <code>gov/*</code> covers <code>gov/team/app</code>.
+      A rule may target <strong>default</strong> to keep a namespace on local
+      storage, or bring it back, while a broader rule still sends its siblings
+      elsewhere — put the narrower rule above.</p>
     ${tableOrEmpty(rows,
       '<tr><th class="num">Order</th><th>Pattern</th><th>Backend</th><th></th></tr>', '')}
     ${misplaced.length ? `<div class="card" style="margin-top:1rem;background:var(--bg)">
@@ -1774,7 +1779,9 @@ window.checkBackend = async (name, btn) => {
 window.addStorageRule = async () => {
   const routing = (await api('/settings')).routing || {};
   const options = (routing.backends || [])
-    .map((b) => `<option value="${esc(b.name)}">${esc(b.name)}</option>`).join('');
+    .map((b) => b.name === 'default'
+      ? `<option value="default">default — local storage (${esc(b.endpoint || '')})</option>`
+      : `<option value="${esc(b.name)}">${esc(b.name)}</option>`).join('');
   const v = await modal({
     title: 'Add a routing rule',
     okLabel: 'Add rule',

@@ -705,6 +705,19 @@ Rules are checked in order and the first match wins, so specific patterns go
 above general ones. `*` spans `/`, so `gov/*` also covers `gov/team/app`. A
 repository matching no rule uses the default backend.
 
+A rule can target **`default`** as well as a named backend, which is how a
+namespace stays on — or returns to — local storage while a broader rule sends
+its siblings elsewhere:
+
+```
+ 10  demo/keep-*  -> default     local disk
+100  demo/*       -> remote      s3
+```
+
+Without it the only way back was to delete or narrow the rule that sent the
+content away, which is a blunt instrument when that rule is still right for
+everything else.
+
 **The routing key is the repository, not the user who pushed.** Following the
 actor would let one repository accumulate layers in several buckets depending on
 who happened to push them, and would make the residency boundary track people
