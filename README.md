@@ -159,6 +159,18 @@ this registry.
 - Per-tag risk in the repository listing, findings and re-scan on the image page
 - Advisories are cached and shared across images, with a freshness bound
 
+**Storage routing**
+
+- Blobs are routed to a backend by repository namespace, so one registry can
+  hold content that must not share storage: `gov/*` in a GovCloud bucket,
+  `partners/*` in a commercial one, everything else on local disk
+- Ordered rules, first match wins; anything unmatched uses the default backend
+- Cross-repository blob mounting is refused across backends, which is what stops
+  a mount publishing content into a bucket that never received the bytes
+- Changing a rule never moves or breaks anything: a repository keeps reading from
+  where its blobs already are, and is listed as misplaced until an explicit
+  migration copies and verifies them
+
 **Access control**
 
 - Users with `admin`/`user` roles; the last administrator cannot be removed
@@ -322,7 +334,18 @@ Everything under `/api` accepts either a session cookie (web UI) or an
 | `GET` | `/api/auth/me` | Current principal and its permissions |
 | `POST` | `/api/auth/password` | Change your own password |
 | `GET` | `/api/stats` | Counts and storage usage |
-| `POST` | `/api/storage/check` | Write, read back and delete a probe object; confirms the blob store is reachable and writable (admin) |
+| `POST` | `/api/storage/check` | Write, read back and delete a probe object; confirms the blob store is reachable and writable (admin). `?backend=<name>` probes a named one |
+| `PUT` | `/api/storage` | Set the default backend, after proving it works (admin) |
+| `POST` | `/api/storage/migrate` | Move every blob to the saved default backend (admin) |
+| `GET` | `/api/storage/migrate` | Migration progress |
+| `GET` | `/api/storage/backends` | Named backends and their health (admin) |
+| `POST` | `/api/storage/backends` | Add a named backend, after proving it works (admin) |
+| `DELETE` | `/api/storage/backends/<name>` | Remove a backend; refused while a rule points at it (admin) |
+| `GET` | `/api/storage/rules` | Routing rules in evaluation order (admin) |
+| `POST` | `/api/storage/rules` | Add a rule (admin) |
+| `PATCH` | `/api/storage/rules/<id>` | Reorder a rule (admin) |
+| `DELETE` | `/api/storage/rules/<id>` | Delete a rule (admin) |
+| `POST` | `/api/repositories/<name>/migrate` | Move one repository's blobs to the backend its rule names (admin) |
 | `GET` | `/api/repositories` | Repositories visible to the caller |
 | `GET` | `/api/repositories/<name>` | Tags, manifests and untagged manifests |
 | `PATCH` | `/api/repositories/<name>` | Set public / immutable / description |
@@ -692,6 +715,83 @@ it: events are queued, and a saturated queue drops them and counts the drops.
 
 ---
 
+## Storage routing
+
+One registry can store blobs in several places, chosen by the repository they
+belong to. The case this exists for is content that must not share storage: an
+export-controlled namespace belongs in a GovCloud bucket, a partner namespace in
+a commercial one, scratch work on local disk.
+
+Configure it under **Maintenance**: add named backends, then ordered rules that
+send repository namespaces to them.
+
+```
+ 10  gov/*        -> govcloud       s3, us-gov-west-1
+ 20  partners/*   -> commercial     s3, us-east-1
+ 30  public/*     -> archive        s3
+  —  *            -> default        local disk
+```
+
+Rules are checked in order and the first match wins, so specific patterns go
+above general ones. `*` spans `/`, so `gov/*` also covers `gov/team/app`. A
+repository matching no rule uses the default backend.
+
+**The routing key is the repository, not the user who pushed.** Following the
+actor would let one repository accumulate layers in several buckets depending on
+who happened to push them, and would make the residency boundary track people
+rather than content. Who may push into a namespace is a separate question,
+answered by the [per-repository grants](#repository-access-grants) that already
+existed.
+
+**Deduplication stops being global.** A layer in two repositories on two
+backends is stored twice. For a boundary that is the point, not a regression:
+deduplicating across it would put one copy of the bytes in whichever bucket saw
+them first.
+
+**Cross-repository blob mounting is refused across backends.** A mount links a
+blob into another repository without moving bytes, so across a boundary the
+target would advertise content whose bytes are in a bucket it never reads — a
+broken pull, and where the boundary is a jurisdiction, content escaping the
+region it was confined to. The registry declines and the client falls back to a
+normal upload, which puts the bytes where they belong.
+
+**Garbage collection is per backend**, with a reachable set per backend rather
+than one global set. A digest alive in one bucket says nothing about an
+identical orphan in another, and a single set would keep that orphan forever.
+
+### Changing a rule does not move anything
+
+Blobs do not move themselves, so a rule added after content exists leaves that
+content where it is. The repository keeps reading from — and writing to — the
+backend its blobs are already in, and is listed as **misplaced** until you move
+it. Following the new rule for reads would 404 every image the repository
+already held; following it for writes alone would split one repository across
+two buckets.
+
+Moving one is a migration, from the button beside it or:
+
+```bash
+curl -u admin:PASSWORD -X POST \
+  https://registry.example.com/api/repositories/team-a/app/migrate
+```
+
+It copies only the digests that repository references, verifies each one by
+reading it back from the target and comparing against the digest its key
+encodes, and only then starts reading from the new backend. Writes are mirrored
+to the target while the copy runs, so a push landing mid-move is not lost at the
+switch. A failure changes nothing: the repository still reads from where it was,
+and blobs already copied make a retry resume rather than start over. The old
+backend keeps its copy until you remove it.
+
+Only one migration runs at a time; a second is refused while one is in flight.
+
+**Upgrading an existing registry** records a placement for every repository that
+already has content, before any rule is consulted — before routing existed there
+was one backend, so that is where their blobs are. Without that, a rule added
+later would treat them as new and send their reads to an empty bucket.
+
+---
+
 ## Putting storage on another disk
 
 The compose file stores data in a named Docker volume, which lives under
@@ -928,7 +1028,8 @@ Layout:
 cmd/registry/      entrypoint, bootstrap, graceful shutdown
 internal/config/   environment configuration
 internal/db/       SQLite schema, migrations and queries
-internal/store/    content-addressable blob store and upload sessions
+internal/store/    content-addressable blob store, upload sessions,
+                   backend routing and migration between backends
 internal/auth/     passwords, tokens, principals, scope matching
 internal/api/      OCI /v2 API, management API, UI serving
 internal/gc/       mark-and-sweep garbage collection
