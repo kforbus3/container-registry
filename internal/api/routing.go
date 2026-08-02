@@ -55,6 +55,15 @@ func (s *Server) LoadRouting(ctx context.Context) error {
 	}
 	s.Store.Router().Replace(routed, live)
 
+	// Repositories that predate placement tracking have content but no record
+	// of where it is. Recording it before any rule is consulted is what stops a
+	// rule added later from redirecting their reads to an empty bucket.
+	if n, err := s.DB.BackfillRepoStorage(ctx, s.Store.Router().Fallback().Name()); err != nil {
+		return err
+	} else if n > 0 {
+		s.Log.Info("recorded storage placement for existing repositories", "count", n)
+	}
+
 	// Where blobs actually are, which is what reads and writes follow until a
 	// migration moves them.
 	placements, err := s.DB.AllRepoStorage(ctx)
