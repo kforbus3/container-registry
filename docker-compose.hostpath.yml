@@ -1,0 +1,29 @@
+# Store everything on a specific host path — typically a second, larger disk.
+#
+#   REGISTRY_STORAGE_PATH=/mnt/data/registry \
+#     docker compose -f docker-compose.yml -f docker-compose.hostpath.yml up -d
+#
+# The default compose file uses a named volume, which lives under
+# /var/lib/docker/volumes and therefore on the OS disk. That is the wrong place
+# when the OS disk is small: blobs, the upload scratch area and the metadata
+# database all grow there.
+#
+# Prepare the directory first. The registry runs as UID 10001 and does not run
+# as root, and a bind-mounted host directory keeps the ownership it has on the
+# host — unlike a named volume, Docker does not initialise it from the image.
+# A directory created with mkdir is owned by root, and the registry cannot write
+# to it:
+#
+#   sudo mkdir -p /mnt/data/registry
+#   sudo chown 10001:10001 /mnt/data/registry
+#
+# Combine with docker-compose.local.yml for plain HTTP on 5001:
+#
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose.local.yml -f docker-compose.hostpath.yml up -d
+services:
+  registry:
+    volumes: !override
+      - ${REGISTRY_STORAGE_PATH:?set REGISTRY_STORAGE_PATH to the directory blobs should live in}:/var/lib/registry
+      # Certificates stay where the base file expects them.
+      - ${REGISTRY_CERT_DIR:-./certs}:/certs:ro
