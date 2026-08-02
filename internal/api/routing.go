@@ -333,3 +333,51 @@ func (s *Server) routingView(ctx context.Context) map[string]any {
 		"misplaced": s.misplaced(ctx),
 	}
 }
+
+// handleRepoMigrate moves one repository's blobs to wherever the rules now say
+// they belong.
+func (s *Server) handleRepoMigrate(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	router := s.Store.Router()
+	target, rule := router.Target(repo.Name)
+	if target == nil {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("rule %q names a backend that is not configured", rule))
+		return
+	}
+	digests, err := s.DB.RepoBlobDigests(r.Context(), repo.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not list this repository's blobs")
+		return
+	}
+
+	err = s.Store.MigrateRepo(context.Background(), repo.Name, target, digests, func(err error) {
+		if err != nil {
+			s.Log.Error("repository migration failed", "repo", repo.Name, "err", err)
+			return
+		}
+		// Only now does the repository start reading from the new backend. Doing
+		// it earlier would point reads at a copy that was not finished.
+		ctx := context.Background()
+		if dbErr := s.DB.RecordRepoStorage(ctx, repo.ID, target.Name()); dbErr != nil {
+			s.Log.Error("migration finished but placement was not recorded",
+				"repo", repo.Name, "err", dbErr)
+			return
+		}
+		s.Store.Router().SetPlacement(repo.Name, target.Name())
+		s.Log.Info("repository migrated", "repo", repo.Name, "backend", target.Name())
+	})
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.audit(r, "storage.repo.migrate", repo.Name, "", target.Name())
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"repository": repo.Name,
+		"to":         target.Name(),
+		"blobs":      len(digests),
+	})
+}

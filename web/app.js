@@ -1713,8 +1713,14 @@ function rulesCard(routing) {
       <h3>${misplaced.length} repositor${misplaced.length === 1 ? 'y is' : 'ies are'} not where the rules say</h3>
       <p class="muted small">Changing a rule does not move anything already
         stored. These still have their blobs in the backend they were pushed to:</p>
-      <p class="mono small">${misplaced.slice(0, 12).map(esc).join(', ')}${
-        misplaced.length > 12 ? ` and ${misplaced.length - 12} more` : ''}</p>
+      <div class="table-wrap"><table><tbody>
+        ${misplaced.slice(0, 25).map((name) => `<tr>
+          <td class="mono small">${esc(name)}</td>
+          <td class="actions"><button class="btn ghost small"
+            onclick="migrateRepo('${jsq(name)}',this)">Move now</button></td>
+        </tr>`).join('')}
+      </tbody></table></div>
+      ${misplaced.length > 25 ? `<p class="muted small">and ${misplaced.length - 25} more</p>` : ''}
       <p class="muted small">Nothing is broken by this: reads and writes for a
         repository keep following the backend its blobs are already in, so pulls
         and pushes carry on working. New repositories matching the rule go
@@ -1873,6 +1879,23 @@ window.deleteStorageRule = async (id) => {
     toast('Rule deleted', 'success');
     route();
   } catch (ex) { toast(ex.message, 'error'); }
+};
+
+window.migrateRepo = async (name, btn) => {
+  if (!await confirmDanger('Move this repository?',
+    `Copy every blob ${name} references to the backend its rule names, verifying ` +
+    `each one, then start reading from there. Pushes keep working throughout, and ` +
+    `nothing is switched unless the whole copy succeeds. The old backend keeps ` +
+    `its copy.`, 'Move')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Moving…'; }
+  try {
+    const r = await api(`/repositories/${encodeURI(name)}/migrate`, { method: 'POST' });
+    toast(`Moving ${r.blobs} blobs to ${r.to}`, 'success');
+    pollMigration();
+  } catch (ex) {
+    toast(ex.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Move now'; }
+  }
 };
 
 window.moveStorageRule = async (id, priority) => {

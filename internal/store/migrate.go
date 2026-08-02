@@ -316,3 +316,86 @@ func (s *Store) deleteBoth(ctx context.Context, key string) error {
 	}
 	return s.primary().Delete(ctx, key)
 }
+
+// MigrateRepo moves one repository's blobs to another backend.
+//
+// This is the counterpart to a rule that was added after content already
+// existed. Only the digests this repository references are copied: a backend
+// may hold blobs for many repositories, and moving all of them because one
+// repository's rule changed would drag unrelated content across a boundary it
+// was never meant to cross.
+//
+// Writes for the repository are mirrored to the target for the duration, and
+// the placement is only updated by the caller once the copy has finished
+// cleanly, so a failure leaves the repository reading from where it already is.
+func (s *Store) MigrateRepo(ctx context.Context, repo string, target Backend,
+	digests []string, onDone func(error)) error {
+
+	if target == nil {
+		return fmt.Errorf("no target backend")
+	}
+	rs := s.For(repo)
+	from, err := rs.Backend()
+	if err != nil {
+		return err
+	}
+	if from.Name() == target.Name() {
+		return fmt.Errorf("%s already stores its blobs in %s", repo, target.Name())
+	}
+	if !s.migrateStart(from.Name(), target.Name()) {
+		return fmt.Errorf("a migration is already running")
+	}
+	s.migration.update(func(st *MigrationState) { st.Total = int64(len(digests)) })
+	s.router.SetMirror(repo, target)
+
+	go func() {
+		err := s.copyDigests(ctx, from, target, digests)
+		s.router.ClearMirror(repo)
+		s.migrateFinish(err)
+		if onDone != nil {
+			onDone(err)
+		}
+	}()
+	return nil
+}
+
+// copyDigests copies a named set of blobs, verifying each against the digest it
+// is stored under.
+func (s *Store) copyDigests(ctx context.Context, from, target Backend, digests []string) error {
+	for _, d := range digests {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		key, err := blobKey(d)
+		if err != nil {
+			// A malformed digest in the database is not something a migration
+			// can fix, and skipping it silently would understate what moved.
+			return fmt.Errorf("bad digest %q: %w", d, err)
+		}
+		info, err := from.Stat(ctx, key)
+		if err != nil {
+			// The link exists but the bytes do not. Garbage collection or an
+			// interrupted push can leave that behind; it is not a reason to
+			// abandon the move.
+			s.migration.update(func(st *MigrationState) { st.Skipped++ })
+			continue
+		}
+		if existing, err := target.Stat(ctx, key); err == nil && existing.Size == info.Size {
+			s.migration.update(func(st *MigrationState) {
+				st.Skipped++
+				st.BytesDone += info.Size
+			})
+			continue
+		}
+		if err := s.copyOne(ctx, from, target, info); err != nil {
+			return fmt.Errorf("copying %s: %w", d, err)
+		}
+		s.migration.update(func(st *MigrationState) {
+			st.Copied++
+			st.BytesDone += info.Size
+		})
+	}
+	return nil
+}

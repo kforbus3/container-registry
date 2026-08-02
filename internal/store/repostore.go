@@ -139,10 +139,35 @@ func (r *RepoStore) PutBytesWith(algo string, body []byte) (string, error) {
 	if _, err := backend.Stat(context.Background(), key); err == nil {
 		return digest, nil // already present; content-addressed so identical
 	}
-	if err := r.s.putTo(context.Background(), backend, key, bytes.NewReader(body), int64(len(body))); err != nil {
+	if err := r.put(context.Background(), backend, key, bytes.NewReader(body), int64(len(body))); err != nil {
 		return "", err
 	}
 	return digest, nil
+}
+
+// put writes to this repository's backend and, while it is being migrated, to
+// the backend it is moving to.
+//
+// The mirror copy re-reads from the primary rather than teeing the original
+// stream: a layer can be gigabytes, and buffering it to feed two writers would
+// undo the streaming the upload path is careful to preserve.
+func (r *RepoStore) put(ctx context.Context, backend Backend, key string, body io.Reader, size int64) error {
+	if err := r.s.putTo(ctx, backend, key, body, size); err != nil {
+		return err
+	}
+	m := r.s.router.Mirror(r.repo)
+	if m == nil || m.Name() == backend.Name() {
+		return nil
+	}
+	rc, err := backend.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("mirroring %s: %w", key, err)
+	}
+	defer rc.Close()
+	if err := m.Put(ctx, key, rc, size); err != nil {
+		return fmt.Errorf("mirroring %s: %w", key, err)
+	}
+	return nil
 }
 
 // Delete removes a blob from this repository's backend.
