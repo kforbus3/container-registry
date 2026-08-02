@@ -2,10 +2,12 @@ package sbom
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 
@@ -26,6 +28,21 @@ type Limits struct {
 	MaxTotalBytes int64
 	// MaxBinaries caps how many executables are inspected for Go build info.
 	MaxBinaries int
+	// MaxBinaryBytes caps a single executable inspected for Go build info.
+	// It is far larger than MaxFileBytes because Go links statically: a real
+	// service binary of 150-200 MiB is ordinary, and capping these at the
+	// general file limit silently skipped exactly the images -- distroless and
+	// FROM scratch -- that build info is the only component source for.
+	MaxBinaryBytes int64
+	// BinarySpillBytes is the size above which an executable is buffered to a
+	// temporary file rather than memory, so a large binary does not have to be
+	// held in RAM to be read.
+	BinarySpillBytes int64
+	// MaxArchives and MaxArchiveBytes bound Java archive inspection. A jar has
+	// to be read whole -- its coordinates are in the zip directory at the end
+	// of the file -- so both a count and a size cap are needed.
+	MaxArchives     int
+	MaxArchiveBytes int64
 	// MaxManifests caps how many language-package metadata files are retained.
 	// A large node_modules tree can hold tens of thousands.
 	MaxManifests int
@@ -40,6 +57,10 @@ func DefaultLimits() Limits {
 		MaxManifestBytes: 1 << 20,   // 1 MiB: a package.json is a few KiB
 		MaxTotalBytes:    8 << 30,   // 8 GiB of decompressed content
 		MaxBinaries:      256,
+		MaxBinaryBytes:   1 << 30, // 1 GiB
+		MaxArchives:      4096,
+		MaxArchiveBytes:  64 << 20,
+		BinarySpillBytes: 24 << 20,
 		MaxManifests:     20_000,
 		MaxEntries:       500_000,
 	}
@@ -63,7 +84,9 @@ const (
 	kindIgnore   fileKind = iota
 	kindOSFile            // a fixed-path OS file: apk/dpkg database or os-release
 	kindRPMDB             // an RPM database, in any of its container formats
-	kindManifest          // an npm or Python package metadata file
+	kindManifest          // a language package metadata file
+	kindArchive           // a Java archive, read for its Maven coordinates
+	kindRuntime           // an interpreter built into the image, not packaged
 )
 
 func classify(name string) fileKind {
@@ -72,8 +95,14 @@ func classify(name string) fileKind {
 		return kindOSFile
 	case isRPMDatabase(name):
 		return kindRPMDB
-	case isNPMManifest(name), isPythonMetadata(name):
+	case isNPMManifest(name), isPythonMetadata(name), isGemspec(name),
+		isDotNetDeps(name), isComposerInstalled(name):
 		return kindManifest
+	case isJavaArchive(name):
+		return kindArchive
+	}
+	if _, ok := runtimeProbeFor(name); ok {
+		return kindRuntime
 	}
 	return kindIgnore
 }
@@ -86,8 +115,13 @@ type layerScan struct {
 	// manifests holds language-package metadata, keyed by path so a later
 	// layer replaces an earlier one and whiteouts can remove entries.
 	manifests map[string][]byte
-	binaries  []executable
-	limits    Limits
+	archives  map[string][]byte
+	runtimes  map[string]pkg
+	// spills are temporary files holding large executables, removed when the
+	// scan finishes.
+	spills   []string
+	binaries []executable
+	limits   Limits
 
 	entries            int
 	total              int64
@@ -96,14 +130,38 @@ type layerScan struct {
 
 // executable is a candidate program buffered for Go build-info extraction.
 type executable struct {
-	path    string
+	path string
+	// Exactly one of content or spill is set: small binaries stay in memory,
+	// large ones are written to a temporary file so reading a 200 MiB
+	// executable does not cost 200 MiB of heap.
 	content []byte
+	spill   string
+}
+
+// open returns a reader over the executable and its length. The caller closes
+// what it gets back.
+func (e executable) open() (io.ReaderAt, int64, func(), error) {
+	if e.spill == "" {
+		return bytes.NewReader(e.content), int64(len(e.content)), func() {}, nil
+	}
+	f, err := os.Open(e.spill)
+	if err != nil {
+		return nil, 0, func() {}, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, func() {}, err
+	}
+	return f, st.Size(), func() { f.Close() }, nil
 }
 
 func newLayerScan(l Limits) *layerScan {
 	return &layerScan{
 		files:     map[string][]byte{},
 		manifests: map[string][]byte{},
+		archives:  map[string][]byte{},
+		runtimes:  map[string]pkg{},
 		limits:    l,
 	}
 }
@@ -122,6 +180,9 @@ type Result struct {
 // be supplied lowest-first, as they appear in the manifest.
 func Scan(layers []LayerSource, l Limits) (*Result, error) {
 	s := newLayerScan(l)
+	// Large executables are buffered to temporary files; they must go away
+	// whether the scan succeeds or fails.
+	defer s.cleanupSpills()
 	for i, layer := range layers {
 		if err := s.applyLayer(layer); err != nil {
 			if errors.Is(err, errBudgetExhausted) {
@@ -153,14 +214,27 @@ func Scan(layers []LayerSource, l Limits) (*Result, error) {
 		}
 	}
 	for path, content := range s.manifests {
-		if isNPMManifest(path) {
+		switch {
+		case isNPMManifest(path):
 			res.Packages = append(res.Packages, parseNPM(path, content)...)
-		} else {
+		case isGemspec(path):
+			res.Packages = append(res.Packages, parseGemspec(path, content)...)
+		case isDotNetDeps(path):
+			res.Packages = append(res.Packages, parseDotNetDeps(path, content)...)
+		case isComposerInstalled(path):
+			res.Packages = append(res.Packages, parseComposerInstalled(path, content)...)
+		default:
 			res.Packages = append(res.Packages, parsePython(path, content)...)
 		}
 	}
+	for path, content := range s.archives {
+		res.Packages = append(res.Packages, parseJavaArchive(path, content)...)
+	}
+	for _, p := range s.runtimes {
+		res.Packages = append(res.Packages, p)
+	}
 	for _, b := range s.binaries {
-		res.Packages = append(res.Packages, parseGoBinary(b.path, b.content)...)
+		res.Packages = append(res.Packages, parseGoBinaryAt(b)...)
 	}
 	return res, nil
 }
@@ -291,6 +365,30 @@ func (s *layerScan) consider(name string, hdr *tar.Header, tr io.Reader) error {
 		}
 		s.files[name] = b
 
+	case kindRuntime:
+		probe, ok := runtimeProbeFor(name)
+		if !ok {
+			return nil
+		}
+		if p, found := scanRuntime(probe, name, tr, s.limits.MaxBinaryBytes); found {
+			s.runtimes[p.Ecosystem] = p
+		}
+
+	case kindArchive:
+		if len(s.archives) >= s.limits.MaxArchives {
+			s.manifestsTruncated = true
+			return nil
+		}
+		// A jar is read whole because its coordinates live in the zip central
+		// directory, which is at the end of the file.
+		b, err := s.readBounded(tr, hdr.Size, s.limits.MaxArchiveBytes)
+		if err != nil {
+			return err
+		}
+		if int64(len(b)) == hdr.Size {
+			s.archives[name] = b
+		}
+
 	case kindManifest:
 		if len(s.manifests) >= s.limits.MaxManifests {
 			s.manifestsTruncated = true
@@ -306,7 +404,17 @@ func (s *layerScan) consider(name string, hdr *tar.Header, tr io.Reader) error {
 		if !s.isCandidateBinary(name, hdr) {
 			return nil
 		}
-		b, err := s.readBounded(tr, hdr.Size, s.limits.MaxFileBytes)
+		if hdr.Size > s.limits.BinarySpillBytes {
+			exe, err := s.spillBinary(name, hdr.Size, tr)
+			if err != nil {
+				return err
+			}
+			if exe != nil {
+				s.binaries = append(s.binaries, *exe)
+			}
+			return nil
+		}
+		b, err := s.readBounded(tr, hdr.Size, s.limits.BinarySpillBytes)
 		if err != nil {
 			return err
 		}
@@ -326,8 +434,10 @@ func (s *layerScan) isCandidateBinary(name string, hdr *tar.Header) bool {
 	if hdr.FileInfo().Mode()&0o111 == 0 {
 		return false
 	}
-	if hdr.Size < 1<<20 || hdr.Size > s.limits.MaxFileBytes {
-		// Go binaries are never tiny, and anything huge is not worth buffering.
+	if hdr.Size < 1<<20 || hdr.Size > s.limits.MaxBinaryBytes {
+		// Go binaries are never tiny. The upper bound is generous because a
+		// statically linked service binary is routinely over a hundred
+		// megabytes, and those are the ones worth reading.
 		return false
 	}
 	// Skip obvious shared libraries and scripts.
@@ -386,4 +496,42 @@ func looksExecutable(b []byte) bool {
 		return true // Mach-O 64-bit big endian
 	}
 	return false
+}
+
+// spillBinary writes a large executable to a temporary file, checking the magic
+// number from the first bytes so a big data file is not copied for nothing.
+func (s *layerScan) spillBinary(name string, size int64, tr io.Reader) (*executable, error) {
+	head := make([]byte, 4)
+	n, err := io.ReadFull(tr, head)
+	if err != nil && n < 4 {
+		return nil, nil // too short to be an executable
+	}
+	if !looksExecutable(head[:n]) {
+		return nil, nil
+	}
+	f, err := os.CreateTemp("", "registry-sbom-bin-*")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := f.Write(head[:n]); err != nil {
+		os.Remove(f.Name())
+		return nil, err
+	}
+	if _, err := io.Copy(f, io.LimitReader(tr, min64(size, s.limits.MaxBinaryBytes))); err != nil {
+		os.Remove(f.Name())
+		return nil, err
+	}
+	s.spills = append(s.spills, f.Name())
+	return &executable{path: name, spill: f.Name()}, nil
+}
+
+// cleanupSpills removes the temporary files a scan created. It runs even when
+// the scan failed, so a registry scanning large images does not slowly fill
+// its temporary directory.
+func (s *layerScan) cleanupSpills() {
+	for _, p := range s.spills {
+		os.Remove(p)
+	}
+	s.spills = nil
 }

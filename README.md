@@ -144,9 +144,11 @@ this registry.
 - Every pushed image is scanned and described in [CycloneDX](https://cyclonedx.org/) 1.5
 - Published back as an OCI referrer (`artifactType: application/vnd.cyclonedx+json`),
   so `oras discover`, `cosign` and any OCI-aware scanner find it
-- Detects OS packages (`apk`, `dpkg`, `rpm`), language packages (npm, PyPI) and
-  Go module versions embedded in binaries — the last covers `FROM scratch` and
-  distroless images that have no package database at all
+- Detects OS packages (`apk`, `dpkg`, `rpm`), language packages (npm, PyPI,
+  Maven/Java archives, RubyGems, NuGet, Composer), Go module versions embedded
+  in binaries — which covers `FROM scratch` and distroless images with no
+  package database — and interpreters compiled into an image rather than
+  installed, such as the Python and Node builds in their official images
 - Runs on background workers; a push is never delayed or failed by it
 
 **Vulnerability scanning**
