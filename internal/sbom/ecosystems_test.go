@@ -182,3 +182,67 @@ func TestScanRuntimeAcrossChunkBoundary(t *testing.T) {
 		t.Errorf("marker spanning a read boundary was missed: %+v found=%v", p, found)
 	}
 }
+
+// TestManifestContinuationLines covers the jar manifest wrapping rule. Values
+// wrap at 72 bytes onto a line beginning with a single space, and reading them
+// line by line silently truncates anything longer -- which is how a component
+// name once arrived cut off mid-word.
+func TestManifestContinuationLines(t *testing.T) {
+	body := "Manifest-Version: 1.0\n" +
+		"Bundle-SymbolicName: org.example.some.very.long.bundle.identifier.th\n" +
+		" at.wraps\n" +
+		"Bundle-Version: 4.5.6\n"
+	fields := parseManifestFields([]byte(body))
+	want := "org.example.some.very.long.bundle.identifier.that.wraps"
+	if fields["Bundle-SymbolicName"] != want {
+		t.Errorf("got %q, want %q", fields["Bundle-SymbolicName"], want)
+	}
+
+	jar := buildJar(t, map[string]string{"META-INF/MANIFEST.MF": body})
+	got := parseJavaArchive("opt/thing.jar", jar)
+	if len(got) != 1 || got[0].Name != want || got[0].Version != "4.5.6" {
+		t.Errorf("parse gave %+v", got)
+	}
+}
+
+// TestManifestProseIsNotAPackageName is the regression test for a malformed
+// purl. ASM sets Implementation-Title to a sentence; a name with spaces and
+// commas cannot appear in a package URL and would match no advisory.
+func TestManifestProseIsNotAPackageName(t *testing.T) {
+	body := "Implementation-Title: ASM, a very small and fast Java bytecode manipul\n" +
+		" ation framework\n" +
+		"Implementation-Version: 9.9.1\n"
+	jar := buildJar(t, map[string]string{"META-INF/MANIFEST.MF": body})
+
+	// No usable identifier and no version in the file name: report nothing
+	// rather than a name that cannot be expressed as a purl.
+	if got := parseJavaArchive("opt/lib/asm.jar", jar); len(got) != 0 {
+		t.Errorf("prose was accepted as a package name: %+v", got)
+	}
+
+	// The same archive named properly falls back to the file name.
+	got := parseJavaArchive("opt/lib/asm-9.9.1.jar", jar)
+	if len(got) != 1 || got[0].Name != "asm" || got[0].Version != "9.9.1" {
+		t.Errorf("file-name fallback gave %+v", got)
+	}
+
+	// An identifier-shaped title is still accepted.
+	body = "Implementation-Title: commons-lang3\nImplementation-Version: 3.14.0\n"
+	got = parseJavaArchive("opt/lib/x.jar", buildJar(t, map[string]string{"META-INF/MANIFEST.MF": body}))
+	if len(got) != 1 || got[0].Name != "commons-lang3" {
+		t.Errorf("identifier-shaped title rejected: %+v", got)
+	}
+}
+
+func TestIsIdentifierLike(t *testing.T) {
+	for _, ok := range []string{"org.slf4j", "commons-io", "gson", "org.example.Bundle"} {
+		if !isIdentifierLike(ok) {
+			t.Errorf("%q should be usable as a package name", ok)
+		}
+	}
+	for _, bad := range []string{"", "Java Runtime Environment", "ASM, a framework", "a (b)"} {
+		if isIdentifierLike(bad) {
+			t.Errorf("%q should be rejected", bad)
+		}
+	}
+}

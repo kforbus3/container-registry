@@ -104,28 +104,80 @@ func parseJavaArchive(archivePath string, content []byte) []pkg {
 	return nil
 }
 
-// javaFromManifest reads Implementation-* or OSGi Bundle-* headers.
+// javaFromManifest reads an identifier out of a jar manifest.
+//
+// Field order matters. Bundle-SymbolicName and Automatic-Module-Name are
+// identifiers by definition; Implementation-Title is frequently prose -- ASM
+// sets it to "ASM, a very small and fast Java bytecode manipulation framework"
+// -- and a name like that cannot be part of a package URL and would never match
+// an advisory. It is used only when it actually looks like an identifier.
 func javaFromManifest(archivePath string, body []byte) (pkg, bool) {
-	fields := map[string]string{}
-	for _, line := range strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n") {
-		k, v, ok := strings.Cut(line, ": ")
-		if ok {
-			fields[strings.TrimSpace(k)] = strings.TrimSpace(v)
-		}
-	}
-	name := firstNonEmpty(fields["Implementation-Title"], fields["Bundle-SymbolicName"], fields["Automatic-Module-Name"])
-	version := firstNonEmpty(fields["Implementation-Version"], fields["Bundle-Version"], fields["Specification-Version"])
-	if name == "" || version == "" {
+	fields := parseManifestFields(body)
+	version := firstNonEmpty(
+		fields["Bundle-Version"],
+		fields["Implementation-Version"],
+		fields["Specification-Version"],
+	)
+	if version == "" {
 		return pkg{}, false
 	}
-	// A symbolic name can carry directives after a semicolon.
-	if i := strings.IndexByte(name, ';'); i > 0 {
-		name = name[:i]
+	for _, key := range []string{"Bundle-SymbolicName", "Automatic-Module-Name", "Implementation-Title"} {
+		name := fields[key]
+		// A symbolic name can carry directives after a semicolon.
+		if i := strings.IndexByte(name, ';'); i > 0 {
+			name = name[:i]
+		}
+		if !isIdentifierLike(name) {
+			continue
+		}
+		return pkg{
+			Name: name, Version: version, Ecosystem: "maven",
+			Source: "MANIFEST.MF", Path: archivePath,
+		}, true
 	}
-	return pkg{
-		Name: name, Version: version, Ecosystem: "maven",
-		Source: "MANIFEST.MF", Path: archivePath,
-	}, true
+	return pkg{}, false
+}
+
+// parseManifestFields reads a jar manifest, joining the continuation lines the
+// format requires.
+//
+// A manifest wraps every value at 72 bytes and continues it on the next line
+// with a single leading space. Reading line by line without rejoining silently
+// truncates any value past that length, which is how a name arrived here cut
+// off mid-word.
+func parseManifestFields(body []byte) map[string]string {
+	fields := map[string]string{}
+	var key string
+	var value strings.Builder
+	flush := func() {
+		if key != "" {
+			fields[key] = value.String()
+		}
+		key, value = "", strings.Builder{}
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, " ") && key != "" {
+			value.WriteString(strings.TrimPrefix(line, " "))
+			continue
+		}
+		flush()
+		if k, v, ok := strings.Cut(line, ": "); ok {
+			key = strings.TrimSpace(k)
+			value.WriteString(strings.TrimSpace(v))
+		}
+	}
+	flush()
+	return fields
+}
+
+// isIdentifierLike rejects prose. A package URL cannot carry spaces or commas,
+// so a "name" containing them is a description that happened to be in a field
+// this reads, and emitting it would produce a purl that matches nothing.
+func isIdentifierLike(name string) bool {
+	if name == "" || len(name) > 200 {
+		return false
+	}
+	return !strings.ContainsAny(name, " ,()[]{}\"'\\")
 }
 
 var jarFileName = regexp.MustCompile(`^(.+?)-(\d[\w.\-]*)$`)
@@ -136,6 +188,9 @@ func javaFromFileName(archivePath string) (pkg, bool) {
 	base = strings.TrimSuffix(base, path.Ext(base))
 	m := jarFileName.FindStringSubmatch(base)
 	if m == nil {
+		return pkg{}, false
+	}
+	if !isIdentifierLike(m[1]) {
 		return pkg{}, false
 	}
 	return pkg{
