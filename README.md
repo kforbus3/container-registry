@@ -650,6 +650,54 @@ it: events are queued, and a saturated queue drops them and counts the drops.
 
 ---
 
+## Putting storage on another disk
+
+The compose file stores data in a named Docker volume, which lives under
+`/var/lib/docker/volumes` — on the OS disk. That is the wrong place when the OS
+disk is small, because everything that grows is in there.
+
+Point it at another mount instead:
+
+```bash
+sudo mkdir -p /mnt/data/registry
+sudo chown 10001:10001 /mnt/data/registry     # the uid the registry runs as
+
+REGISTRY_STORAGE_PATH=/mnt/data/registry \
+  docker compose -f docker-compose.yml -f docker-compose.hostpath.yml up -d
+```
+
+The `chown` is the step that catches people out. The registry does not run as
+root, and a bind-mounted host directory keeps whatever ownership it has on the
+host — unlike a named volume, which Docker initialises from the image, ownership
+included. A directory created with `mkdir` belongs to root, and the registry
+cannot write to it. Setting `REGISTRY_STORAGE_PATH` is mandatory in that
+override rather than defaulting to something: a typo silently filling the OS
+disk is exactly what it exists to prevent.
+
+To keep using a named volume while its contents live elsewhere, bind it instead
+of moving Docker's whole data root:
+
+```yaml
+volumes:
+  registry-data:
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/registry
+```
+
+**What ends up there.** Blobs, the upload scratch area, `registry.db` and its
+write-ahead log, and `config.key`. Size the disk for the blobs; the database is
+small by comparison.
+
+Note that **object storage does not empty this directory**. With an S3 backend
+configured, blobs go to the bucket but the metadata database, the encryption key
+and the upload scratch area stay local, and an in-progress upload is buffered in
+full before it is committed — so a registry taking multi-gigabyte layers still
+needs room for them. Only completed blobs move off the disk.
+
+---
+
 ## Object storage
 
 Blobs live on local disk by default. Setting `REGISTRY_S3_BUCKET` moves them to
