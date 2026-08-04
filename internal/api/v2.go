@@ -132,7 +132,10 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request, repo string, act 
 
 	p, err := s.resolvePrincipal(r)
 	if err != nil {
+		var throttled *ErrThrottled
 		switch {
+		case errors.As(err, &throttled):
+			s.authThrottleResponse(w, throttled)
 		case errors.Is(err, auth.ErrDisabled):
 			s.challengeScoped(w, r, "account is disabled", want)
 		case errors.Is(err, auth.ErrTokenInactive):
@@ -229,6 +232,33 @@ func (s *Server) grantAllows(r *http.Request, p *auth.Principal, name string, ac
 	return db.RoleRank(role) >= db.RoleRank(need)
 }
 
+// mayRepo reports whether the caller may perform an action on a repository.
+//
+// It is the management API's equivalent of the guard on /v2, and combines both
+// halves of the permission model: the principal's own rights (verb permission
+// plus repository pattern, or a bearer token's scopes) and the per-repository
+// grants. Every /api handler that reads or changes a repository must go through
+// it — checking only CanPushRepo and friends misses grants entirely, which
+// leaves a locked-down repository wide open through this API while /v2 refuses.
+func (s *Server) mayRepo(r *http.Request, repo *db.Repository, act action) bool {
+	p := principalFrom(r.Context())
+	if p == nil {
+		return false
+	}
+	return s.basicAllows(r, p, repo.Name, act) && s.grantAllows(r, p, repo.Name, act)
+}
+
+// repoAccessIndex loads the grants that bear on the caller, for filtering a
+// listing. Administrators are never governed, so they get a nil index, which
+// allows everything.
+func (s *Server) repoAccessIndex(r *http.Request) (*db.RepoAccessIndex, error) {
+	p := principalFrom(r.Context())
+	if p == nil || p.Admin {
+		return nil, nil
+	}
+	return s.DB.RepoAccessByName(r.Context(), p.UserID)
+}
+
 // scopeFor renders the access scope a request needs, in the form a token
 // service expects.
 func scopeFor(repo string, act action) string {
@@ -265,6 +295,11 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := s.resolvePrincipal(r)
+	var throttled *ErrThrottled
+	if errors.As(err, &throttled) {
+		s.authThrottleResponse(w, throttled)
+		return
+	}
 	if err != nil {
 		s.challenge(w, r, "invalid credentials")
 		return
@@ -290,6 +325,11 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	p, err := s.resolvePrincipal(r)
+	var throttled *ErrThrottled
+	if errors.As(err, &throttled) {
+		s.authThrottleResponse(w, throttled)
+		return
+	}
 	if err != nil || (p == nil && !s.Cfg.AllowAnonymousPull) {
 		s.challenge(w, r, "authentication required")
 		return
@@ -318,9 +358,21 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Grants filter the catalog as well as the repository endpoints: a name is
+	// itself information, and a repository somebody deliberately locked down
+	// should not be discoverable by listing.
+	access, err := s.repoAccessIndex(r)
+	if err != nil {
+		s.ociErr(w, http.StatusInternalServerError, codeUnsupported, "failed to list repositories", nil)
+		return
+	}
 	visible := make([]string, 0, len(names))
 	for _, name := range names {
-		if p.CanPullRepo(name) || s.repoIsPublic(r, name) {
+		public := s.repoIsPublic(r, name)
+		if !p.CanPullRepo(name) && !public {
+			continue
+		}
+		if public || access.Allows(name, db.RoleRead) {
 			visible = append(visible, name)
 		}
 		if n > 0 && len(visible) == n {

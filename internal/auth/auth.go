@@ -121,6 +121,11 @@ type Principal struct {
 	// issued by this registry. They replace the pattern entirely: the token
 	// says exactly what it may do, and nothing outside that list is permitted.
 	Scopes []string
+
+	// Bearer marks a principal that came from a token this registry issued
+	// through the Docker token flow. Such a token is a credential for the
+	// distribution API and nothing else, so the management API refuses it.
+	Bearer bool
 }
 
 // scopeGrants reports whether the principal's bearer-token scopes permit an
@@ -247,6 +252,10 @@ type Authenticator struct {
 	// it every blob GET on a busy pull would issue a database write.
 	touchMu   sync.Mutex
 	lastTouch map[int64]time.Time
+
+	// validMu guards lastValid, the cache behind StillValid.
+	validMu   sync.Mutex
+	lastValid map[validityKey]time.Time
 }
 
 // touchInterval is how stale a token's last_used_at may get before it is
@@ -254,7 +263,11 @@ type Authenticator struct {
 const touchInterval = time.Minute
 
 func New(database *db.DB) *Authenticator {
-	return &Authenticator{DB: database, lastTouch: map[int64]time.Time{}}
+	return &Authenticator{
+		DB:        database,
+		lastTouch: map[int64]time.Time{},
+		lastValid: map[validityKey]time.Time{},
+	}
 }
 
 // noteTokenUse records that a token was used, at most once per touchInterval.
@@ -379,3 +392,60 @@ func (a *Authenticator) AuthenticateSession(ctx context.Context, sessionID strin
 
 // NewSessionID returns an opaque, unguessable session identifier.
 func NewSessionID() (string, error) { return NewSecret(32) }
+
+// ---------------------------------------------------------------- revocation
+
+// revalidateInterval is how stale the answer to "is this account still usable"
+// may get on the bearer-token path. It bounds the window in which a disabled
+// account or a revoked token keeps working.
+const revalidateInterval = 30 * time.Second
+
+type validityKey struct{ userID, tokenID int64 }
+
+// StillValid reports whether a principal recovered from a signed bearer token
+// is still backed by a usable account and token.
+//
+// A bearer token is verified by its signature alone, which is what keeps a pull
+// of a hundred layers from becoming a hundred database round trips. The cost is
+// that disabling an account or revoking a token has no effect on one until it
+// expires. Re-checking on a short cache splits the difference: the hot path
+// still answers from memory, and revocation takes effect within
+// revalidateInterval rather than a whole token lifetime.
+func (a *Authenticator) StillValid(ctx context.Context, userID, tokenID int64) bool {
+	if userID == 0 {
+		return true // anonymous: there is no account to disable
+	}
+	key := validityKey{userID, tokenID}
+	now := time.Now()
+
+	a.validMu.Lock()
+	if checked, ok := a.lastValid[key]; ok && now.Sub(checked) < revalidateInterval {
+		a.validMu.Unlock()
+		return true
+	}
+	a.validMu.Unlock()
+
+	u, err := a.DB.GetUser(ctx, userID)
+	if err != nil || u.Disabled {
+		a.forget(key)
+		return false
+	}
+	if tokenID != 0 {
+		t, err := a.DB.GetToken(ctx, tokenID)
+		if err != nil || !t.Active() {
+			a.forget(key)
+			return false
+		}
+	}
+
+	a.validMu.Lock()
+	a.lastValid[key] = now
+	a.validMu.Unlock()
+	return true
+}
+
+func (a *Authenticator) forget(key validityKey) {
+	a.validMu.Lock()
+	delete(a.lastValid, key)
+	a.validMu.Unlock()
+}

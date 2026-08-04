@@ -106,8 +106,22 @@ func (s *Server) adminRouter() http.Handler {
 func (s *Server) requireAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, err := s.resolvePrincipal(r)
+		var throttled *ErrThrottled
+		if errors.As(err, &throttled) {
+			s.authThrottleResponse(w, throttled)
+			return
+		}
 		if err != nil || p == nil {
 			writeErr(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		// A registry-issued bearer token is a credential for the distribution
+		// API: short-lived, scoped to one repository, and handed to whatever
+		// container tool asked for it. It is not a login. Accepting one here
+		// would let a pull token read the audit log and mint a full API token.
+		if p.Bearer {
+			writeErr(w, http.StatusForbidden,
+				"registry bearer tokens are only valid on /v2; use an API token or a session")
 			return
 		}
 		r = r.WithContext(withPrincipal(r.Context(), p))
@@ -144,14 +158,36 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+// loginKeys names the identities a failed sign-in counts against. The username
+// arrives in the body here rather than in a header, so the keys have to be
+// built by hand rather than read off the request.
+func loginKeys(r *http.Request, username string) []string {
+	keys := []string{"ip:" + remoteIP(r)}
+	if username = strings.TrimSpace(username); username != "" {
+		keys = append(keys, "user:"+strings.ToLower(username))
+	}
+	return keys
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// This endpoint sits outside requireAuth, so nothing above it bounds the
+	// rate: without this check the login form is an unmetered password oracle
+	// that costs a bcrypt hash per guess.
+	keys := loginKeys(r, req.Username)
+	if blocked, retry := s.authFailures.Blocked(keys...); blocked {
+		s.authThrottleResponse(w, &ErrThrottled{Retry: retry})
+		return
+	}
 	p, err := s.Auth.AuthenticatePassword(r.Context(), req.Username, req.Password)
 	if err != nil {
+		if !errors.Is(err, auth.ErrDisabled) {
+			s.authFailures.Fail(keys...)
+		}
 		s.DB.Audit(r.Context(), req.Username, "login.failed", "", "", err.Error(), remoteIP(r))
 		if errors.Is(err, auth.ErrDisabled) {
 			writeErr(w, http.StatusForbidden, "account is disabled")
@@ -160,6 +196,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
+	s.authFailures.Succeed(keys...)
 	sid, err := auth.NewSessionID()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to create session")
@@ -250,6 +287,15 @@ func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusInternalServerError, "failed to update password")
 		return
 	}
+	// Every other session signed in with the old password is ended. Keeping
+	// this one is the whole point of the exception: signing yourself out of the
+	// page you just used would be surprising, and it is the session that just
+	// proved it knows the current password.
+	var current string
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		current = c.Value
+	}
+	s.DB.DeleteUserSessions(r.Context(), u.ID, current)
 	s.audit(r, "user.password_changed", "", u.Username, "self-service")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
 }
@@ -602,7 +648,7 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Force re-authentication everywhere after an administrative reset.
-		s.DB.ExecContext(r.Context(), `DELETE FROM sessions WHERE user_id = ?`, id)
+		s.DB.DeleteUserSessions(r.Context(), id, "")
 		s.audit(r, "user.password_reset", "", u.Username, "by administrator")
 	}
 
@@ -902,7 +948,6 @@ func mustRepoGrants(r *http.Request, s *Server, repoID int64) []*db.RepoGrant {
 
 // repoRetention lists or creates retention rules for a repository.
 func (s *Server) repoRetention(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
-	p := principalFrom(r.Context())
 	switch r.Method {
 	case http.MethodGet:
 		rules, err := s.DB.RetentionRules(r.Context(), repo.ID)
@@ -913,7 +958,7 @@ func (s *Server) repoRetention(w http.ResponseWriter, r *http.Request, repo *db.
 		writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
 
 	case http.MethodPost:
-		if !p.CanDeleteRepo(repo.Name) {
+		if !s.mayRepo(r, repo, actionDelete) {
 			writeErr(w, http.StatusForbidden,
 				"delete permission is required to configure retention")
 			return
@@ -972,7 +1017,7 @@ func (s *Server) repoRetentionRule(w http.ResponseWriter, r *http.Request, repo 
 		writeErr(w, http.StatusBadRequest, "invalid rule id")
 		return
 	}
-	if !principalFrom(r.Context()).CanDeleteRepo(repo.Name) {
+	if !s.mayRepo(r, repo, actionDelete) {
 		writeErr(w, http.StatusForbidden, "delete permission is required")
 		return
 	}
@@ -1211,9 +1256,20 @@ func (s *Server) handleRepoList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to list repositories")
 		return
 	}
+	// A repository locked down with grants is hidden from everyone it was not
+	// granted to. Listing it would leak the one thing the grant was meant to
+	// keep private: that it exists at all.
+	access, err := s.repoAccessIndex(r)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to resolve repository access")
+		return
+	}
 	visible := make([]*db.Repository, 0, len(repos))
 	for _, repo := range repos {
-		if p.CanPullRepo(repo.Name) || repo.Public {
+		if !p.CanPullRepo(repo.Name) && !repo.Public {
+			continue
+		}
+		if repo.Public || access.Allows(repo.Name, db.RoleRead) {
 			visible = append(visible, repo)
 		}
 	}
@@ -1268,8 +1324,10 @@ func (s *Server) handleRepoSubtree(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no such repository")
 		return
 	}
-	p := principalFrom(r.Context())
-	if !p.CanPullRepo(name) && !repo.Public {
+	// Grants are checked here, not only on /v2: this API can read a repository's
+	// contents and change it, so it has to answer the same question the registry
+	// guard does.
+	if !s.mayRepo(r, repo, actionPull) {
 		writeErr(w, http.StatusForbidden, "you do not have access to this repository")
 		return
 	}
@@ -1318,7 +1376,6 @@ func unescapePath(s string) (string, error) {
 }
 
 func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
-	p := principalFrom(r.Context())
 	switch r.Method {
 	case http.MethodGet:
 		tags, err := s.DB.ListTagsDetailed(r.Context(), repo.ID)
@@ -1381,7 +1438,7 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		})
 
 	case http.MethodPatch:
-		if !p.Admin && !p.CanPushRepo(repo.Name) {
+		if !s.mayRepo(r, repo, actionPush) {
 			writeErr(w, http.StatusForbidden, "push permission is required to configure a repository")
 			return
 		}
@@ -1434,7 +1491,7 @@ func (s *Server) repoRoot(w http.ResponseWriter, r *http.Request, repo *db.Repos
 		writeJSON(w, http.StatusOK, updated)
 
 	case http.MethodDelete:
-		if !p.CanDeleteRepo(repo.Name) {
+		if !s.mayRepo(r, repo, actionDelete) {
 			writeErr(w, http.StatusForbidden, "delete permission is required")
 			return
 		}
@@ -1479,8 +1536,7 @@ func (s *Server) repoTags(w http.ResponseWriter, r *http.Request, repo *db.Repos
 // createTag points a new tag at an existing manifest, identified either by
 // digest or by an existing tag. This is the API-driven retag operation.
 func (s *Server) createTag(w http.ResponseWriter, r *http.Request, repo *db.Repository) {
-	p := principalFrom(r.Context())
-	if !p.CanPushRepo(repo.Name) {
+	if !s.mayRepo(r, repo, actionPush) {
 		writeErr(w, http.StatusForbidden, "push permission is required to create a tag")
 		return
 	}
@@ -1532,7 +1588,6 @@ func (s *Server) createTag(w http.ResponseWriter, r *http.Request, repo *db.Repo
 }
 
 func (s *Server) repoTag(w http.ResponseWriter, r *http.Request, repo *db.Repository, tag string) {
-	p := principalFrom(r.Context())
 	switch r.Method {
 	case http.MethodGet:
 		t, err := s.DB.GetTag(r.Context(), repo.ID, tag)
@@ -1543,7 +1598,7 @@ func (s *Server) repoTag(w http.ResponseWriter, r *http.Request, repo *db.Reposi
 		writeJSON(w, http.StatusOK, t)
 
 	case http.MethodDelete:
-		if !p.CanDeleteRepo(repo.Name) {
+		if !s.mayRepo(r, repo, actionDelete) {
 			writeErr(w, http.StatusForbidden, "delete permission is required")
 			return
 		}
@@ -1567,7 +1622,6 @@ func (s *Server) repoTag(w http.ResponseWriter, r *http.Request, repo *db.Reposi
 // repoManifest returns a manifest with its parsed content and, for image
 // manifests, the decoded image config.
 func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.Repository, digest string) {
-	p := principalFrom(r.Context())
 	if !store.ValidDigest(digest) {
 		writeErr(w, http.StatusBadRequest, "invalid digest")
 		return
@@ -1579,7 +1633,7 @@ func (s *Server) repoManifest(w http.ResponseWriter, r *http.Request, repo *db.R
 	}
 
 	if r.Method == http.MethodDelete {
-		if !p.CanDeleteRepo(repo.Name) {
+		if !s.mayRepo(r, repo, actionDelete) {
 			writeErr(w, http.StatusForbidden, "delete permission is required")
 			return
 		}
@@ -1704,8 +1758,7 @@ func (s *Server) repoRescan(w http.ResponseWriter, r *http.Request, repo *db.Rep
 		writeErr(w, http.StatusServiceUnavailable, "vulnerability scanning is disabled")
 		return
 	}
-	p := principalFrom(r.Context())
-	if !p.CanPushRepo(repo.Name) {
+	if !s.mayRepo(r, repo, actionPush) {
 		writeErr(w, http.StatusForbidden, "push permission is required to trigger a re-scan")
 		return
 	}

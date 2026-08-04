@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -127,9 +129,24 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := s.resolvePrincipal(r)
+	var throttled *ErrThrottled
+	if errors.As(err, &throttled) {
+		s.authThrottleResponse(w, throttled)
+		return
+	}
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+s.Cfg.Realm+`"`)
 		writeErr(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	// A token is issued against a real credential. Letting one bearer token buy
+	// another would turn a five-minute pull token into an indefinite one by
+	// simply asking again before it expires, and would let it widen its own
+	// scope on the way.
+	if p != nil && p.Bearer {
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+s.Cfg.Realm+`"`)
+		writeErr(w, http.StatusUnauthorized,
+			"a bearer token cannot be exchanged for another; authenticate with a password or API token")
 		return
 	}
 	if p == nil {
@@ -210,15 +227,20 @@ func (s *Server) basicAllows(r *http.Request, p *auth.Principal, repo string, ac
 	return false
 }
 
-// principalFromBearer resolves a signed bearer token back into a principal.
-func (s *Server) principalFromBearer(raw string) (*auth.Principal, bool) {
+// principalFromBearer resolves a signed bearer token back into a principal,
+// after confirming the account and token behind it are still usable.
+func (s *Server) principalFromBearer(ctx context.Context, raw string) (*auth.Principal, bool) {
 	t, err := s.verifyToken(raw)
 	if err != nil {
+		return nil, false
+	}
+	if !s.Auth.StillValid(ctx, t.UserID, t.TokenID) {
 		return nil, false
 	}
 	p := &auth.Principal{
 		UserID: t.UserID, Username: t.Subject, TokenID: t.TokenID,
 		RepoPattern: "", // the token's scopes govern instead of a pattern
+		Bearer:      true,
 	}
 	// The granted scopes are the authority. A token with none still resolves to
 	// a principal so anonymous pulls of public repositories work, but an empty

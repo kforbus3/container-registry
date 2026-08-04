@@ -97,3 +97,51 @@ func (d *DB) RepoAccess(ctx context.Context, repoID, userID int64) (role string,
 	}
 	return role, true, nil
 }
+
+// RepoAccessByName answers the same question as RepoAccess for every governed
+// repository at once, keyed by repository name.
+//
+// Listing endpoints need the answer for a whole page. Asking per repository
+// would be a query each; grants are few, so reading them all and indexing them
+// in memory is both simpler and cheaper.
+func (d *DB) RepoAccessByName(ctx context.Context, userID int64) (*RepoAccessIndex, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT r.name, g.user_id, g.role
+		FROM repo_grants g JOIN repositories r ON r.id = g.repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	idx := &RepoAccessIndex{
+		governed: map[string]bool{},
+		roles:    map[string]string{},
+	}
+	for rows.Next() {
+		var name, role string
+		var uid int64
+		if err := rows.Scan(&name, &uid, &role); err != nil {
+			return nil, err
+		}
+		idx.governed[name] = true
+		if uid == userID {
+			idx.roles[name] = role
+		}
+	}
+	return idx, rows.Err()
+}
+
+// RepoAccessIndex is a snapshot of the grants relevant to one user.
+type RepoAccessIndex struct {
+	governed map[string]bool
+	roles    map[string]string
+}
+
+// Allows reports whether the user may act on a repository at the given role.
+// A repository nobody has granted access to is ungoverned and stays visible,
+// which is what keeps the feature opt-in.
+func (i *RepoAccessIndex) Allows(name, need string) bool {
+	if i == nil || !i.governed[name] {
+		return true
+	}
+	return RoleRank(i.roles[name]) >= RoleRank(need)
+}
