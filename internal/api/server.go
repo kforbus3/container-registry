@@ -50,6 +50,10 @@ type Server struct {
 	hooks   *webhook.Dispatcher
 	Metrics *metrics.Registry
 
+	// authFailures throttles wrong credentials, which the request limiters
+	// above cannot: they run only once a caller has been identified.
+	authFailures *ratelimit.Failures
+
 	upstream *proxy.Upstream
 
 	// tokenSecret signs bearer tokens; generated when none is configured.
@@ -141,6 +145,8 @@ func NewServer(cfg *config.Config, database *db.DB, st *store.Store, log *slog.L
 	return &Server{
 		Cfg: cfg, DB: database, Store: st, Auth: auth.New(database), Log: log,
 		Metrics: metrics.New(), tokenSecret: secret, batch: &batchMigration{},
+		authFailures: ratelimit.NewFailures(
+			cfg.AuthFailThreshold, cfg.AuthFailWindow, cfg.AuthLockoutMax),
 	}
 }
 
@@ -298,9 +304,100 @@ func withPrincipal(ctx context.Context, p *auth.Principal) context.Context {
 	return context.WithValue(ctx, principalKey, p)
 }
 
+// ErrThrottled is returned when a caller has failed authentication too often
+// and must wait before trying again.
+type ErrThrottled struct{ Retry time.Duration }
+
+func (e *ErrThrottled) Error() string { return "too many failed authentication attempts" }
+
 // resolvePrincipal authenticates a request from an Authorization header or a
-// session cookie. It returns nil when no usable credential is present.
+// session cookie, throttling repeated failures. It returns nil when no usable
+// credential is present.
+//
+// Every entry point must come through here rather than calling the
+// authenticator directly: the per-caller request limit is applied only once a
+// principal is known, so this is the sole place a wrong credential can be made
+// to cost anything.
 func (s *Server) resolvePrincipal(r *http.Request) (*auth.Principal, error) {
+	principal, err := s.authenticate(r)
+
+	var throttled *ErrThrottled
+	switch {
+	case errors.As(err, &throttled):
+		// Already waiting; hammering the door does not make the wait longer.
+	case errors.Is(err, auth.ErrDisabled), errors.Is(err, auth.ErrTokenInactive):
+		// A disabled account and a revoked token are settled facts rather than
+		// guesses, so they neither count as failures nor clear earlier ones.
+	case err != nil:
+		// A caller who presented nothing has nothing to answer for; only a
+		// credential that was offered and rejected counts against the limit.
+		s.authFailures.Fail(s.authKeys(r)...)
+	case principal != nil:
+		s.authFailures.Succeed(s.authKeys(r)...)
+	}
+	return principal, err
+}
+
+// authKeys are the identities a failed attempt is counted against: the calling
+// address, and the account named by a Basic credential. Counting both bounds
+// one host working through a list of accounts and many hosts working on one
+// account.
+func (s *Server) authKeys(r *http.Request) []string {
+	keys := []string{"ip:" + remoteIP(r)}
+	if user, _, ok := basicUser(r); ok && user != "" {
+		keys = append(keys, "user:"+strings.ToLower(user))
+	}
+	return keys
+}
+
+// throttled reports whether this caller is currently waiting out earlier
+// failures, but only when a credential is actually being presented: an
+// anonymous pull must not be refused because somebody else on the same address
+// mistyped a password.
+func (s *Server) throttled(r *http.Request) *ErrThrottled {
+	if r.Header.Get("Authorization") == "" {
+		if c, err := r.Cookie(sessionCookie); err != nil || c.Value == "" {
+			return nil
+		}
+	}
+	if blocked, retry := s.authFailures.Blocked(s.authKeys(r)...); blocked {
+		return &ErrThrottled{Retry: retry}
+	}
+	return nil
+}
+
+// authThrottleResponse answers a caller that is waiting out failed attempts.
+// It is a 429 rather than a 401 so a client stops retrying and a human reading
+// the log can tell a locked-out caller from a wrong password.
+func (s *Server) authThrottleResponse(w http.ResponseWriter, e *ErrThrottled) {
+	seconds := int(e.Retry.Seconds() + 0.999)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	s.ociErr(w, http.StatusTooManyRequests, codeTooManyRequests,
+		"too many failed authentication attempts; retry after "+strconv.Itoa(seconds)+"s", nil)
+}
+
+// basicUser reads the username from a Basic credential without verifying it.
+func basicUser(r *http.Request) (user, pass string, ok bool) {
+	hdr := r.Header.Get("Authorization")
+	scheme, value, found := strings.Cut(hdr, " ")
+	if !found || !strings.EqualFold(scheme, "basic") {
+		return "", "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+	if err != nil {
+		return "", "", false
+	}
+	user, pass, ok = strings.Cut(string(raw), ":")
+	return user, pass, ok
+}
+
+func (s *Server) authenticate(r *http.Request) (*auth.Principal, error) {
+	if t := s.throttled(r); t != nil {
+		return nil, t
+	}
 	if hdr := r.Header.Get("Authorization"); hdr != "" {
 		scheme, value, found := strings.Cut(hdr, " ")
 		if !found {
@@ -308,11 +405,7 @@ func (s *Server) resolvePrincipal(r *http.Request) (*auth.Principal, error) {
 		}
 		switch strings.ToLower(scheme) {
 		case "basic":
-			raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
-			if err != nil {
-				return nil, auth.ErrBadCredentials
-			}
-			user, pass, ok := strings.Cut(string(raw), ":")
+			user, pass, ok := basicUser(r)
 			if !ok {
 				return nil, auth.ErrBadCredentials
 			}
@@ -324,7 +417,7 @@ func (s *Server) resolvePrincipal(r *http.Request) (*auth.Principal, error) {
 			if _, _, ok := auth.SplitToken(raw); ok {
 				return s.Auth.AuthenticateToken(r.Context(), raw)
 			}
-			if p, ok := s.principalFromBearer(raw); ok {
+			if p, ok := s.principalFromBearer(r.Context(), raw); ok {
 				return p, nil
 			}
 			return nil, auth.ErrBadCredentials

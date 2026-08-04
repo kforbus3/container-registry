@@ -843,6 +843,23 @@ func (d *DB) DeleteSession(ctx context.Context, id string) error {
 	return err
 }
 
+// DeleteUserSessions ends every web session belonging to a user, optionally
+// sparing one — the session the request itself is being made from, so changing
+// your own password does not sign you out of the tab you changed it in.
+//
+// A password is changed either because it was forgotten or because it may be
+// known to someone else. In both cases the sessions it created must not outlive
+// it: they authenticate on the cookie alone and would otherwise keep working.
+func (d *DB) DeleteUserSessions(ctx context.Context, userID int64, except string) error {
+	if except == "" {
+		_, err := d.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID)
+		return err
+	}
+	_, err := d.ExecContext(ctx,
+		`DELETE FROM sessions WHERE user_id = ? AND id != ?`, userID, except)
+	return err
+}
+
 func (d *DB) PurgeExpiredSessions(ctx context.Context) error {
 	_, err := d.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, nowStr())
 	return err

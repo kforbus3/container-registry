@@ -97,6 +97,14 @@ type Config struct {
 	// reachable by them, which a bare path is not when the registry sits
 	// behind a proxy.
 	TokenRealm string
+	// AuthFailThreshold is how many failed authentication attempts a caller
+	// gets before waits are imposed. Zero disables the throttle, which leaves
+	// password guessing unbounded and is not recommended.
+	AuthFailThreshold int
+	// AuthFailWindow is how long a quiet caller keeps its failure count.
+	AuthFailWindow time.Duration
+	// AuthLockoutMax caps the wait imposed on a persistent guesser.
+	AuthLockoutMax time.Duration
 }
 
 func Load() (*Config, error) {
@@ -130,6 +138,7 @@ func Load() (*Config, error) {
 		TokenAuth:          envBool("REGISTRY_TOKEN_AUTH", false),
 		TokenSecret:        os.Getenv("REGISTRY_TOKEN_SECRET"),
 		TokenRealm:         env("REGISTRY_TOKEN_REALM", "/token"),
+		AuthFailThreshold:  envInt("REGISTRY_AUTH_FAIL_THRESHOLD", 5),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -165,6 +174,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.TokenTTL, err = envDuration("REGISTRY_TOKEN_TTL", 5*time.Minute); err != nil {
+		return nil, err
+	}
+	if c.AuthFailWindow, err = envDuration("REGISTRY_AUTH_FAIL_WINDOW", 15*time.Minute); err != nil {
+		return nil, err
+	}
+	if c.AuthLockoutMax, err = envDuration("REGISTRY_AUTH_LOCKOUT_MAX", 15*time.Minute); err != nil {
 		return nil, err
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {

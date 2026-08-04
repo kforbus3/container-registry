@@ -251,6 +251,9 @@ All configuration is by environment variable.
 | `REGISTRY_RATE_LIMIT` | `0` | Requests per minute per caller; `0` disables |
 | `REGISTRY_RATE_LIMIT_WRITES` | *(uses `RATE_LIMIT`)* | Separate, usually lower, limit for pushes and deletes |
 | `REGISTRY_RATE_BURST` | *(one second's worth)* | How many requests may arrive at once |
+| `REGISTRY_AUTH_FAIL_THRESHOLD` | `5` | Failed authentications tolerated before waits begin; `0` disables |
+| `REGISTRY_AUTH_FAIL_WINDOW` | `15m` | How long a quiet caller keeps its failure count |
+| `REGISTRY_AUTH_LOCKOUT_MAX` | `15m` | Longest wait imposed on a persistent guesser |
 | `REGISTRY_S3_BUCKET` | — | Setting this moves blobs to an object store |
 | `REGISTRY_S3_ENDPOINT` | *(derived from region)* | `http://minio:9000`, or an AWS endpoint |
 | `REGISTRY_S3_REGION` | `us-east-1` | Signing region |
@@ -593,6 +596,18 @@ yields a token good for `pull` alone.
 Basic auth keeps working with this enabled, so turning it on cannot break a
 client that already works.
 
+An issued bearer token is a credential for `/v2` and nothing else. It is
+refused by the management API and cannot be exchanged for another token: it is
+short-lived, scoped to one repository, and handed to whatever container tool
+asked for it, so treating it as a login would let a pull token read the audit
+log or mint an API token that outlives it. Sign in to the management API with a
+password or an API token instead.
+
+Because a bearer token is verified by its signature rather than looked up, a
+disabled account or revoked token is re-checked against the database at most
+every 30 seconds rather than on every request — revocation takes effect within
+that window instead of at the end of the token's lifetime.
+
 ---
 
 ## Pull-through cache
@@ -642,6 +657,13 @@ manages the repository's own grants. Two deliberate exceptions — a registry
 administrator is never locked out, or a mistaken grant could make a repository
 unadministrable; and a public repository stays readable, because that is what
 public means.
+
+Grants apply to the management API exactly as they do to `/v2`: an ungranted
+user cannot read a governed repository's tags, manifests or SBOM through
+`/api/repositories`, cannot delete anything in it, and cannot mark it public —
+which would otherwise re-open it to everyone. A governed repository is also
+hidden from `/v2/_catalog` and the repository listing, because a name is itself
+information.
 
 ---
 
@@ -954,6 +976,31 @@ Buckets are held in memory, so limits are **per process**: two instances behind
 a load balancer each enforce their own. A shared counter would need a shared
 store and turn every request into a network round trip.
 
+### Failed authentication
+
+Rate limits apply once a caller is known, which is exactly the point a rejected
+credential never reaches. Failed authentications are therefore counted
+separately, and this is **on by default** — password guessing is otherwise free,
+and each guess costs the registry a bcrypt hash whether or not it was close.
+
+```bash
+REGISTRY_AUTH_FAIL_THRESHOLD=5   # failures tolerated before waiting begins
+REGISTRY_AUTH_FAIL_WINDOW=15m    # how long a quiet caller keeps its count
+REGISTRY_AUTH_LOCKOUT_MAX=15m    # longest wait imposed
+```
+
+Failures are counted against both the calling address and the account being
+tried, so neither one host working through a list of accounts nor many hosts
+working on one account goes unbounded. The wait doubles with each further
+failure up to the maximum, and one success clears the record — a mistyped
+password costs nothing.
+
+While a wait stands the correct credential is refused too; otherwise the
+throttle would report which guess was right. Callers presenting no credential
+are unaffected, so anonymous pulls keep working during someone else's lockout.
+Refusals are `429` with `Retry-After`, not `401`, so a client stops retrying and
+a lockout is distinguishable from a wrong password in the log.
+
 ---
 
 ## Retention and garbage collection
@@ -1076,8 +1123,16 @@ suite run.
 - Passwords are bcrypt-hashed. Token secrets carry 256 bits of entropy and are
   stored as SHA-256, compared in constant time; the plaintext is shown once.
 - Session cookies are `HttpOnly`, `SameSite=Strict`, and `Secure` when TLS is on.
-- An administrative password reset invalidates that user's sessions.
+- An administrative password reset invalidates that user's sessions, and
+  changing your own password ends every session but the one you changed it in.
 - Disabling a user immediately invalidates their tokens.
+- Failed authentications are throttled by default, per address and per account,
+  so password guessing is bounded rather than free. See [Failed
+  authentication](#failed-authentication).
+- Registry-issued bearer tokens are confined to `/v2`; the management API takes
+  a password, a session or an API token.
+- Per-repository grants are enforced identically on `/v2` and the management
+  API, and govern listings as well as access.
 - Uploaded content is verified against its claimed digest before it enters the
   blob store; a mismatch discards the upload.
 - Anonymous pull, when enabled, applies only to repositories explicitly marked

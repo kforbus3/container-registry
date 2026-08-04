@@ -359,6 +359,13 @@ func (s *Server) handleRepoMigrate(w http.ResponseWriter, r *http.Request, repo 
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// Moving blobs between backends is an operator action on storage the
+	// operator configured, not something a repository's own permissions should
+	// reach. Every other storage endpoint is administrator-only; so is this.
+	if p := principalFrom(r.Context()); p == nil || !p.Admin {
+		writeErr(w, http.StatusForbidden, "administrator privileges required")
+		return
+	}
 	router := s.Store.Router()
 	target, rule := router.Target(repo.Name)
 	if target == nil {

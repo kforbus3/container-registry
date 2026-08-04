@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -1782,4 +1783,327 @@ func TestBasicStillWorksWithTokenAuthEnabled(t *testing.T) {
 
 	resp := h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil)
 	h.expectStatus(resp, http.StatusOK, "basic auth alongside token auth")
+}
+
+// ------------------------------------------------- grants on the management API
+
+// The management API can read and change a repository just as thoroughly as
+// /v2 can, so it has to answer the same question about grants. It used not to:
+// every check was against the caller's own permissions, which every user holds
+// over everything, and grants were consulted nowhere.
+func TestGrantsRestrictManagementAPI(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	digest := h.pushImage("team-a/locked", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/locked")
+
+	hash, _ := auth.HashPassword("userpassword")
+	insider, _ := h.db.CreateUser(ctx, "insider", hash, "user")
+	h.db.CreateUser(ctx, "outsider", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, insider.ID, db.RoleRead)
+
+	outsider := asUser("outsider", "userpassword")
+	for _, tc := range []struct {
+		what   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{"read the repository", http.MethodGet, "/api/repositories/team-a/locked", nil},
+		{"read its tags", http.MethodGet, "/api/repositories/team-a/locked/tags", nil},
+		{"read a manifest", http.MethodGet, "/api/repositories/team-a/locked/manifests/" + digest, nil},
+		{"make it public", http.MethodPatch, "/api/repositories/team-a/locked", []byte(`{"public":true}`)},
+		{"delete a tag", http.MethodDelete, "/api/repositories/team-a/locked/tags/v1", nil},
+		{"delete a manifest", http.MethodDelete, "/api/repositories/team-a/locked/manifests/" + digest, nil},
+		{"delete the repository", http.MethodDelete, "/api/repositories/team-a/locked", nil},
+		{"configure retention", http.MethodPost, "/api/repositories/team-a/locked/retention",
+			[]byte(`{"kind":"keep_last","value":1}`)},
+	} {
+		resp := h.do(tc.method, tc.path, tc.body, outsider)
+		h.expectStatus(resp, http.StatusForbidden, "an ungranted user must not "+tc.what)
+	}
+
+	// The granted reader still reads, so the check is not simply refusing
+	// everyone.
+	resp := h.do(http.MethodGet, "/api/repositories/team-a/locked", nil, asUser("insider", "userpassword"))
+	h.expectStatus(resp, http.StatusOK, "a granted reader reads")
+
+	// Read is not write: the same user cannot reconfigure it.
+	resp = h.do(http.MethodPatch, "/api/repositories/team-a/locked", []byte(`{"public":true}`),
+		asUser("insider", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "a reader must not reconfigure")
+}
+
+// Making a governed repository public would re-open it to everyone through
+// /v2, so the ability to do it has to be governed too. This is the escalation
+// the test above forecloses, followed all the way through.
+func TestGrantedWriterCannotBeBypassedByPublishing(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/secret", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/secret")
+
+	hash, _ := auth.HashPassword("userpassword")
+	insider, _ := h.db.CreateUser(ctx, "insider", hash, "user")
+	h.db.CreateUser(ctx, "outsider", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, insider.ID, db.RoleRead)
+
+	resp := h.do(http.MethodPatch, "/api/repositories/team-a/secret", []byte(`{"public":true}`),
+		asUser("outsider", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "publishing someone else's repository")
+
+	resp = h.do(http.MethodGet, "/v2/team-a/secret/manifests/v1", nil, asUser("outsider", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "and so it stays unreadable")
+}
+
+// A name is information. A repository somebody deliberately locked down should
+// not be discoverable by listing it.
+func TestListingsHideGovernedRepositories(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.pushImage("team-a/locked", "v1")
+	h.pushImage("team-b/open", "v1")
+	repo, _ := h.db.GetRepository(ctx, "team-a/locked")
+
+	hash, _ := auth.HashPassword("userpassword")
+	insider, _ := h.db.CreateUser(ctx, "insider", hash, "user")
+	h.db.CreateUser(ctx, "outsider", hash, "user")
+	h.db.GrantRepoAccess(ctx, repo.ID, insider.ID, db.RoleRead)
+
+	var catalog struct {
+		Repositories []string `json:"repositories"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/v2/_catalog", nil, asUser("outsider", "userpassword")),
+		http.StatusOK, &catalog)
+	if slices.Contains(catalog.Repositories, "team-a/locked") {
+		t.Fatalf("catalog leaked a governed repository: %v", catalog.Repositories)
+	}
+	if !slices.Contains(catalog.Repositories, "team-b/open") {
+		t.Fatalf("catalog hid an ungoverned repository: %v", catalog.Repositories)
+	}
+
+	// The granted user still sees it.
+	h.mustJSON(h.do(http.MethodGet, "/v2/_catalog", nil, asUser("insider", "userpassword")),
+		http.StatusOK, &catalog)
+	if !slices.Contains(catalog.Repositories, "team-a/locked") {
+		t.Fatalf("catalog hid a repository the caller was granted: %v", catalog.Repositories)
+	}
+
+	var listing struct {
+		Repositories []struct {
+			Name string `json:"name"`
+		} `json:"repositories"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/api/repositories", nil, asUser("outsider", "userpassword")),
+		http.StatusOK, &listing)
+	for _, repo := range listing.Repositories {
+		if repo.Name == "team-a/locked" {
+			t.Fatal("the management API listed a governed repository")
+		}
+	}
+}
+
+// Storage backends are the operator's business, and moving blobs between them
+// is an operator's action rather than a repository permission.
+func TestRepositoryMigrationIsAdminOnly(t *testing.T) {
+	h := newHarness(t)
+	h.pushImage("team-a/app", "v1")
+
+	hash, _ := auth.HashPassword("userpassword")
+	h.db.CreateUser(context.Background(), "dev", hash, "user")
+
+	resp := h.do(http.MethodPost, "/api/repositories/team-a/app/migrate", nil,
+		asUser("dev", "userpassword"))
+	h.expectStatus(resp, http.StatusForbidden, "a non-admin must not move storage")
+}
+
+// ------------------------------------------------- failed-authentication throttle
+
+// The per-caller request limit runs only once a caller has been identified,
+// which is exactly the point a rejected credential never reaches. Without a
+// separate bound, guessing passwords is free and each guess costs the registry
+// a bcrypt hash.
+func TestRepeatedAuthFailuresAreThrottled(t *testing.T) {
+	h := newHarness(t)
+	h.server.authFailures = ratelimit.NewFailures(3, time.Minute, time.Minute)
+
+	// Up to the threshold, a wrong password is answered as one.
+	for i := 0; i < 3; i++ {
+		resp := h.do(http.MethodGet, "/v2/", nil, asUser("admin", "wrongpassword"))
+		h.expectStatus(resp, http.StatusUnauthorized, "wrong password under the threshold")
+	}
+
+	// Past it, the caller is told to wait instead.
+	resp := h.do(http.MethodGet, "/v2/", nil, asUser("admin", "wrongpassword"))
+	h.expectStatus(resp, http.StatusTooManyRequests, "wrong password past the threshold")
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("a throttled response must say how long to wait")
+	}
+
+	// The right password is refused too while the wait stands: otherwise the
+	// throttle would be a free oracle for whether a guess was correct.
+	resp = h.do(http.MethodGet, "/v2/", nil)
+	h.expectStatus(resp, http.StatusTooManyRequests, "correct password during the wait")
+
+	// An anonymous request is not caught up in it. It presented no credential,
+	// so it has nothing to answer for.
+	resp = h.do(http.MethodGet, "/v2/", nil, anonymous())
+	h.expectStatus(resp, http.StatusUnauthorized, "anonymous during someone else's wait")
+}
+
+// The login form sits outside the authenticated middleware, so it has to do
+// this for itself.
+func TestLoginThrottlesFailures(t *testing.T) {
+	h := newHarness(t)
+	h.server.authFailures = ratelimit.NewFailures(2, time.Minute, time.Minute)
+
+	body := []byte(`{"username":"admin","password":"wrongpassword"}`)
+	for i := 0; i < 2; i++ {
+		resp := h.do(http.MethodPost, "/api/auth/login", body, anonymous())
+		h.expectStatus(resp, http.StatusUnauthorized, "wrong password under the threshold")
+	}
+	resp := h.do(http.MethodPost, "/api/auth/login", body, anonymous())
+	h.expectStatus(resp, http.StatusTooManyRequests, "wrong password past the threshold")
+}
+
+// A successful sign-in clears the record, so a legitimate user who mistyped
+// once is not left carrying it.
+func TestSuccessfulAuthClearsFailures(t *testing.T) {
+	h := newHarness(t)
+	h.server.authFailures = ratelimit.NewFailures(3, time.Minute, time.Minute)
+
+	for i := 0; i < 2; i++ {
+		resp := h.do(http.MethodGet, "/v2/", nil, asUser("admin", "wrongpassword"))
+		h.expectStatus(resp, http.StatusUnauthorized, "wrong password")
+	}
+	resp := h.do(http.MethodGet, "/v2/", nil)
+	h.expectStatus(resp, http.StatusOK, "the right password before the threshold is reached")
+
+	// The count is back to zero, so two more failures are again tolerated —
+	// which they would not be if the earlier ones still counted.
+	for i := 0; i < 2; i++ {
+		resp := h.do(http.MethodGet, "/v2/", nil, asUser("admin", "wrongpassword"))
+		h.expectStatus(resp, http.StatusUnauthorized, "wrong password after a success")
+	}
+}
+
+// ------------------------------------------------- bearer tokens stay on /v2
+
+// A registry-issued bearer token is a credential for the distribution API:
+// short-lived, scoped to one repository, and handed to whatever container tool
+// asked for it. Accepting one as a login would let a pull token read the audit
+// log and mint a full API token that outlives it.
+func TestBearerTokenIsRejectedByManagementAPI(t *testing.T) {
+	h := newHarness(t)
+	h.server.Cfg.TokenAuth = true
+	h.pushImage("team-a/app", "v1")
+
+	var issued struct {
+		Token string `json:"token"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/token?scope="+
+		url.QueryEscape("repository:team-a/app:pull"), nil), http.StatusOK, &issued)
+
+	bearer := func(r *http.Request) {
+		r.Header.Del("Authorization")
+		r.Header.Set("Authorization", "Bearer "+issued.Token)
+	}
+
+	// It works for what it is for.
+	resp := h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil, bearer)
+	h.expectStatus(resp, http.StatusOK, "a bearer token pulls what it was scoped to")
+
+	// And for nothing else.
+	for _, path := range []string{"/api/auth/me", "/api/audit", "/api/stats", "/api/repositories"} {
+		resp := h.do(http.MethodGet, path, nil, bearer)
+		h.expectStatus(resp, http.StatusForbidden, "a bearer token must not reach "+path)
+	}
+	resp = h.do(http.MethodPost, "/api/tokens",
+		[]byte(`{"name":"escalated","can_pull":true,"can_push":true,"can_delete":true}`), bearer)
+	h.expectStatus(resp, http.StatusForbidden, "a bearer token must not mint an API token")
+
+	// Nor can it buy itself a fresh one to outlive its own expiry.
+	resp = h.do(http.MethodGet, "/token?scope="+
+		url.QueryEscape("repository:team-a/app:pull,push"), nil, bearer)
+	h.expectStatus(resp, http.StatusUnauthorized, "a bearer token must not be exchanged for another")
+}
+
+// A bearer token is verified by its signature alone, so without a re-check
+// disabling an account leaves every token it holds working until they expire.
+func TestBearerTokenStopsWorkingWhenAccountIsDisabled(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.server.Cfg.TokenAuth = true
+	h.pushImage("team-a/app", "v1")
+
+	hash, _ := auth.HashPassword("userpassword")
+	u, _ := h.db.CreateUser(ctx, "dev", hash, "user")
+
+	var issued struct {
+		Token string `json:"token"`
+	}
+	h.mustJSON(h.do(http.MethodGet, "/token?scope="+url.QueryEscape("repository:team-a/app:pull"),
+		nil, asUser("dev", "userpassword")), http.StatusOK, &issued)
+
+	bearer := func(r *http.Request) {
+		r.Header.Del("Authorization")
+		r.Header.Set("Authorization", "Bearer "+issued.Token)
+	}
+	resp := h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil, bearer)
+	h.expectStatus(resp, http.StatusOK, "the token works while the account does")
+
+	if err := h.db.SetUserDisabled(ctx, u.ID, true); err != nil {
+		t.Fatalf("SetUserDisabled: %v", err)
+	}
+	// The cached answer is what would otherwise keep it alive; clear it so the
+	// test measures the check rather than the cache.
+	h.server.Auth = auth.New(h.db)
+
+	resp = h.do(http.MethodGet, "/v2/team-a/app/manifests/v1", nil, bearer)
+	h.expectStatus(resp, http.StatusUnauthorized, "the token dies with the account")
+}
+
+// ------------------------------------------------- sessions and passwords
+
+// Sessions authenticate on a cookie alone, so they must not outlive the
+// password that created them.
+func TestPasswordChangeEndsOtherSessions(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	hash, _ := auth.HashPassword("userpassword")
+	h.db.CreateUser(ctx, "dev", hash, "user")
+
+	login := func() string {
+		resp := h.do(http.MethodPost, "/api/auth/login",
+			[]byte(`{"username":"dev","password":"userpassword"}`), anonymous())
+		h.expectStatus(resp, http.StatusOK, "login")
+		for _, c := range resp.Cookies() {
+			if c.Name == sessionCookie {
+				return c.Value
+			}
+		}
+		h.t.Fatal("login returned no session cookie")
+		return ""
+	}
+	stale, current := login(), login()
+
+	withSession := func(id string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.Header.Del("Authorization")
+			r.AddCookie(&http.Cookie{Name: sessionCookie, Value: id})
+		}
+	}
+	resp := h.do(http.MethodPost, "/api/auth/password",
+		[]byte(`{"current_password":"userpassword","new_password":"newuserpassword"}`),
+		withSession(current))
+	h.expectStatus(resp, http.StatusOK, "change own password")
+
+	resp = h.do(http.MethodGet, "/api/auth/me", nil, withSession(stale))
+	h.expectStatus(resp, http.StatusUnauthorized, "a session predating the password change")
+
+	// The session that made the change survives: signing you out of the page
+	// you just used would be surprising, and it just proved it knew the old
+	// password.
+	resp = h.do(http.MethodGet, "/api/auth/me", nil, withSession(current))
+	h.expectStatus(resp, http.StatusOK, "the session that changed the password")
 }
