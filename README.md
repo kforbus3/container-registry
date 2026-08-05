@@ -1091,9 +1091,14 @@ make run         # run locally on :5000
 make test        # run the test suite
 make test-race   # run under the race detector
 make check       # fmt + vet + test
+make audit       # vet + staticcheck + govulncheck
 make docker      # build the container image
 make conformance # run the official OCI distribution-spec conformance suite
 ```
+
+The build stamps the version from `git describe`, which `registry --version`
+reports and which is logged at start-up, so a running instance can be identified
+from its logs. A binary built without that stamp says `dev`.
 
 `make conformance` clones and builds the upstream suite on first run, starts a
 throwaway registry on a scratch data directory, and runs the full set including
