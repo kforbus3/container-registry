@@ -66,3 +66,26 @@ For a deployment that has to stand up to review:
   on the private network.
 - Use the `security_opt`, `cap_drop` and `read_only` settings from
   `docker-compose.yml`; the registry is tested running with them.
+
+## What CI checks
+
+Every push and pull request, and weekly on a schedule:
+
+| Check | What it covers |
+| --- | --- |
+| `go vet`, `gofmt` | Correctness and formatting |
+| `staticcheck` | Dead code, misuse, suspect constructs |
+| `govulncheck` | Known vulnerabilities in code paths this binary reaches |
+| Trivy (image) | Packages the base image contributes |
+| Trivy (config) | The Dockerfile and compose files |
+| `go test -race` | The suite, with the race detector |
+| Image smoke test | The registry starts with no capabilities and a read-only root, and round-trips a blob |
+
+`make audit` runs the source-level ones locally.
+
+CodeQL is configured but **off by default**: it reports through code scanning,
+which needs GitHub Advanced Security on a private repository. Set the repository
+variable `ENABLE_CODEQL` to `true` once code scanning is available under
+Settings → Code security, or if the repository is made public, where it is
+free. Trivy deliberately does not depend on it — findings fail the job and are
+printed in the log instead.

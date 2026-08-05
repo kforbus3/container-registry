@@ -50,8 +50,14 @@ jobs:
           go install honnef.co/go/tools/cmd/staticcheck@latest
           staticcheck ./...
 
+  # CodeQL uploads its results to code scanning, which on a private repository
+  # needs GitHub Advanced Security. Without it the analysis runs to completion
+  # and then fails at the upload, so the job is opt-in: set the repository
+  # variable ENABLE_CODEQL to "true" once code scanning is available (Settings →
+  # Code security), or when the repository is public, where it is free.
   codeql:
     name: CodeQL
+    if: vars.ENABLE_CODEQL == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,14 +78,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
-      actions: read
     steps:
       - uses: actions/checkout@v7
 
       - name: Build
         run: docker build -t container-registry:scan .
 
+      # Findings fail the job and are printed in the log rather than uploaded as
+      # SARIF, which needs code scanning enabled. This works on any repository,
+      # and a failed job is a louder signal than an alert nobody opens.
+      #
       # The image is scanned as well as the source: the base image contributes
       # packages this repository never names, and they are as much a part of
       # what gets deployed as the binary is.
@@ -87,32 +95,18 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: container-registry:scan
-          format: sarif
-          output: trivy-image.sarif
+          format: table
           severity: CRITICAL,HIGH
+          # An unfixed vulnerability is worth knowing about but cannot be acted
+          # on by upgrading, so it does not fail the build.
           ignore-unfixed: true
+          exit-code: '1'
 
       - name: Scan configuration and manifests
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: .
-          format: sarif
-          output: trivy-config.sarif
+          format: table
           severity: CRITICAL,HIGH
-
-      # A separate upload per scan: code scanning stopped combining multiple
-      # runs under one category, and two scans in one directory is exactly that.
-      - name: Upload image findings
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-image.sarif
-          category: trivy-image
-
-      - name: Upload configuration findings
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-config.sarif
-          category: trivy-config
+          exit-code: '1'

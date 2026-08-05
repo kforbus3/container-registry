@@ -1153,8 +1153,9 @@ a deployment that has to stand up to review.
   re-check the destination as the connection is opened.
 - The container runs as an unprivileged user with no capabilities and a
   read-only root filesystem; CI proves it starts and serves a push that way.
-- CI runs `go vet`, `staticcheck`, `govulncheck`, CodeQL and Trivy against the
-  source and the built image, weekly as well as on every change.
+- CI runs `go vet`, `staticcheck`, `govulncheck` and Trivy against the source
+  and the built image, weekly as well as on every change; CodeQL is configured
+  and opt-in. See [SECURITY.md](SECURITY.md#what-ci-checks).
 
 Run it behind TLS. The `WWW-Authenticate: Basic` challenge that makes
 `docker login` work sends credentials base64-encoded, not encrypted.
