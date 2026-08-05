@@ -43,8 +43,19 @@ vet: ## Run go vet
 fmt: ## Format all Go source
 	gofmt -w ./cmd ./internal ./web
 
+.PHONY: vuln
+vuln: ## Report known vulnerabilities in reachable code
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+.PHONY: staticcheck
+staticcheck: ## Run staticcheck
+	$(GO) run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
 .PHONY: check
 check: fmt vet test ## Format, vet and test
+
+.PHONY: audit
+audit: vet staticcheck vuln ## Everything CI checks except the image scan
 
 .PHONY: certs
 certs: ## Generate a development TLS certificate into ./certs

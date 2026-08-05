@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -105,6 +106,100 @@ type Config struct {
 	AuthFailWindow time.Duration
 	// AuthLockoutMax caps the wait imposed on a persistent guesser.
 	AuthLockoutMax time.Duration
+	// TrustedProxies are the networks whose X-Forwarded-* headers are believed.
+	// Empty means none: anyone can send those headers, so believing them from
+	// an arbitrary peer lets a caller choose the address recorded in the audit
+	// log and the identity its rate limit is counted against.
+	TrustedProxies []netip.Prefix
+	// TrustAllProxies is set by REGISTRY_TRUSTED_PROXIES=*, for a deployment
+	// where the registry is reachable only through its proxy.
+	TrustAllProxies bool
+	// HSTSMaxAge is the max-age sent in Strict-Transport-Security over a secure
+	// connection. Zero omits the header.
+	HSTSMaxAge time.Duration
+	// HSTSIncludeSubdomains and HSTSPreload add the corresponding directives.
+	// Both are off by default: they make promises about names this registry
+	// does not own and, in the case of preload, ones that are hard to undo.
+	HSTSIncludeSubdomains bool
+	HSTSPreload           bool
+	// TLSMinVersion is the oldest TLS version accepted, as "1.2" or "1.3".
+	TLSMinVersion string
+	// WebhookAllowInternal permits webhook deliveries to loopback, link-local
+	// and private addresses. Off by default: a webhook URL is operator-supplied
+	// but the registry is what fetches it, which makes it a way to reach
+	// services that were never exposed.
+	WebhookAllowInternal bool
+}
+
+// Trusts reports whether forwarding headers may be believed from an address.
+func (c *Config) Trusts(addr string) bool {
+	if c.TrustAllProxies {
+		return true
+	}
+	if len(c.TrustedProxies) == 0 {
+		return false
+	}
+	ip, err := netip.ParseAddr(addr)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	for _, prefix := range c.TrustedProxies {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// HSTSHeader renders the Strict-Transport-Security value.
+func (c *Config) HSTSHeader() string {
+	if c.HSTSMaxAge <= 0 {
+		return ""
+	}
+	h := "max-age=" + strconv.Itoa(int(c.HSTSMaxAge.Seconds()))
+	if c.HSTSIncludeSubdomains {
+		h += "; includeSubDomains"
+	}
+	if c.HSTSPreload {
+		h += "; preload"
+	}
+	return h
+}
+
+// ParseTrustedProxies reads a comma-separated list of addresses and CIDR
+// blocks. A bare address is treated as a single-host network, which is what an
+// operator writing one proxy's address means. "*" trusts any peer.
+func ParseTrustedProxies(raw string) ([]netip.Prefix, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false, nil
+	}
+	if raw == "*" {
+		return nil, true, nil
+	}
+	var out []netip.Prefix
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			prefix, err := netip.ParsePrefix(part)
+			if err != nil {
+				return nil, false, fmt.Errorf("REGISTRY_TRUSTED_PROXIES: %q: %w", part, err)
+			}
+			out = append(out, prefix.Masked())
+			continue
+		}
+		ip, err := netip.ParseAddr(part)
+		if err != nil {
+			return nil, false, fmt.Errorf("REGISTRY_TRUSTED_PROXIES: %q is not an address or CIDR block", part)
+		}
+		ip = ip.Unmap()
+		out = append(out, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	return out, false, nil
 }
 
 func Load() (*Config, error) {
@@ -139,6 +234,11 @@ func Load() (*Config, error) {
 		TokenSecret:        os.Getenv("REGISTRY_TOKEN_SECRET"),
 		TokenRealm:         env("REGISTRY_TOKEN_REALM", "/token"),
 		AuthFailThreshold:  envInt("REGISTRY_AUTH_FAIL_THRESHOLD", 5),
+
+		HSTSIncludeSubdomains: envBool("REGISTRY_HSTS_INCLUDE_SUBDOMAINS", false),
+		HSTSPreload:           envBool("REGISTRY_HSTS_PRELOAD", false),
+		TLSMinVersion:         env("REGISTRY_TLS_MIN_VERSION", "1.2"),
+		WebhookAllowInternal:  envBool("REGISTRY_WEBHOOK_ALLOW_INTERNAL", false),
 	}
 	c.DBPath = env("REGISTRY_DB_PATH", c.DataDir+"/registry.db")
 
@@ -181,6 +281,17 @@ func Load() (*Config, error) {
 	}
 	if c.AuthLockoutMax, err = envDuration("REGISTRY_AUTH_LOCKOUT_MAX", 15*time.Minute); err != nil {
 		return nil, err
+	}
+	if c.HSTSMaxAge, err = envDuration("REGISTRY_HSTS_MAX_AGE", 365*24*time.Hour); err != nil {
+		return nil, err
+	}
+	if c.TrustedProxies, c.TrustAllProxies, err = ParseTrustedProxies(os.Getenv("REGISTRY_TRUSTED_PROXIES")); err != nil {
+		return nil, err
+	}
+	switch c.TLSMinVersion {
+	case "1.2", "1.3":
+	default:
+		return nil, fmt.Errorf("REGISTRY_TLS_MIN_VERSION must be 1.2 or 1.3, not %q", c.TLSMinVersion)
 	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return nil, fmt.Errorf("REGISTRY_TLS_CERT and REGISTRY_TLS_KEY must be set together")

@@ -1,7 +1,6 @@
 package sbom
 
 import (
-	"bytes"
 	"debug/buildinfo"
 	"io"
 	"strings"
@@ -102,15 +101,11 @@ func parseDpkg(db []byte) []pkg {
 	return out
 }
 
-// parseGoBinary extracts module versions embedded in a Go executable. Images
-// built FROM scratch or distroless carry no package database at all, so this is
-// often the only source of component data for them.
-func parseGoBinary(path string, content []byte) []pkg {
-	return goPackagesFrom(path, bytes.NewReader(content))
-}
-
-// parseGoBinaryAt reads build info from an executable however it was buffered,
-// in memory or spilled to a temporary file.
+// parseGoBinaryAt extracts module versions embedded in a Go executable, read
+// however it was buffered — in memory or spilled to a temporary file.
+//
+// Images built FROM scratch or distroless carry no package database at all, so
+// this is often the only source of component data for them.
 func parseGoBinaryAt(e executable) []pkg {
 	r, _, closer, err := e.open()
 	if err != nil {

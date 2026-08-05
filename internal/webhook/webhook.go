@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -63,6 +64,9 @@ type Dispatcher struct {
 	Attempts int
 	// Timeout bounds a single delivery attempt.
 	Timeout time.Duration
+	// AllowInternal permits delivery to loopback, link-local and private
+	// addresses.
+	AllowInternal bool
 
 	http  *http.Client
 	queue chan Event
@@ -81,15 +85,36 @@ type Stats struct {
 }
 
 func New(database *db.DB, log *slog.Logger, queueDepth int, timeout time.Duration) *Dispatcher {
+	return NewWithOptions(database, log, queueDepth, timeout, false)
+}
+
+// NewWithOptions builds a dispatcher that may be permitted to deliver to
+// internal addresses. See destination.go for what that means and why it is off
+// by default.
+func NewWithOptions(database *db.DB, log *slog.Logger, queueDepth int, timeout time.Duration, allowInternal bool) *Dispatcher {
 	if queueDepth <= 0 {
 		queueDepth = 512
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second, Control: dialGuard(allowInternal)}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = dialer.DialContext
 	return &Dispatcher{
 		DB: database, Log: log, Attempts: 3, Timeout: timeout,
-		http:  &http.Client{Timeout: timeout},
+		AllowInternal: allowInternal,
+		http: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+			// A redirect is a second destination, chosen by the receiver rather
+			// than by the administrator who wrote the URL. Following one would
+			// undo the check that was just made, so deliveries do not follow
+			// them: a webhook receiver has no reason to redirect.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		queue: make(chan Event, queueDepth),
 	}
 }

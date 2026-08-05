@@ -316,7 +316,7 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p != nil && !p.IsAnonymous() {
-		s.DB.Audit(r.Context(), p.Display(), "login", "", "", "api version check", remoteIP(r))
+		s.DB.Audit(r.Context(), p.Display(), "login", "", "", "api version check", s.remoteIP(r))
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

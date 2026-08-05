@@ -161,8 +161,8 @@ type loginRequest struct {
 // loginKeys names the identities a failed sign-in counts against. The username
 // arrives in the body here rather than in a header, so the keys have to be
 // built by hand rather than read off the request.
-func loginKeys(r *http.Request, username string) []string {
-	keys := []string{"ip:" + remoteIP(r)}
+func (s *Server) loginKeys(r *http.Request, username string) []string {
+	keys := []string{"ip:" + s.remoteIP(r)}
 	if username = strings.TrimSpace(username); username != "" {
 		keys = append(keys, "user:"+strings.ToLower(username))
 	}
@@ -178,7 +178,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// This endpoint sits outside requireAuth, so nothing above it bounds the
 	// rate: without this check the login form is an unmetered password oracle
 	// that costs a bcrypt hash per guess.
-	keys := loginKeys(r, req.Username)
+	keys := s.loginKeys(r, req.Username)
 	if blocked, retry := s.authFailures.Blocked(keys...); blocked {
 		s.authThrottleResponse(w, &ErrThrottled{Retry: retry})
 		return
@@ -188,7 +188,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if !errors.Is(err, auth.ErrDisabled) {
 			s.authFailures.Fail(keys...)
 		}
-		s.DB.Audit(r.Context(), req.Username, "login.failed", "", "", err.Error(), remoteIP(r))
+		s.DB.Audit(r.Context(), req.Username, "login.failed", "", "", err.Error(), s.remoteIP(r))
 		if errors.Is(err, auth.ErrDisabled) {
 			writeErr(w, http.StatusForbidden, "account is disabled")
 			return
@@ -208,7 +208,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.DB.TouchUserLogin(r.Context(), p.UserID)
-	s.DB.Audit(r.Context(), p.Username, "login", "", "", "web ui", remoteIP(r))
+	s.DB.Audit(r.Context(), p.Username, "login", "", "", "web ui", s.remoteIP(r))
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
@@ -837,8 +837,13 @@ func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name and url are required")
 		return
 	}
-	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
-		writeErr(w, http.StatusBadRequest, "url must be http or https")
+	// A webhook URL is written by an administrator but fetched by the registry,
+	// so a URL naming something only the registry can reach is a way into the
+	// network behind it. This catches the mistake at the point it is made; the
+	// delivery path checks again as it connects, which is the check DNS cannot
+	// be raced past.
+	if err := webhook.ValidateURL(r.Context(), req.URL, s.Cfg.WebhookAllowInternal); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.Events == "" {
@@ -925,26 +930,6 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------- retention
-
-// mustRetentionRules returns a repository's rules, or an empty list if they
-// cannot be read: the repository page should still render.
-func mustRetentionRules(r *http.Request, s *Server, repoID int64) []*db.RetentionRule {
-	rules, err := s.DB.RetentionRules(r.Context(), repoID)
-	if err != nil {
-		return []*db.RetentionRule{}
-	}
-	return rules
-}
-
-// mustRepoGrants returns a repository's access grants, or an empty list if they
-// cannot be read: the repository page should still render.
-func mustRepoGrants(r *http.Request, s *Server, repoID int64) []*db.RepoGrant {
-	grants, err := s.DB.RepoGrants(r.Context(), repoID)
-	if err != nil {
-		return []*db.RepoGrant{}
-	}
-	return grants
-}
 
 // repoRetention lists or creates retention rules for a repository.
 func (s *Server) repoRetention(w http.ResponseWriter, r *http.Request, repo *db.Repository) {

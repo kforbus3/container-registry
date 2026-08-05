@@ -315,7 +315,7 @@ func parseComposerInstalled(installedPath string, content []byte) []pkg {
 	var wrapped struct {
 		Packages []entry `json:"packages"`
 	}
-	entries := wrapped.Packages
+	var entries []entry
 	if err := json.Unmarshal(content, &wrapped); err == nil && len(wrapped.Packages) > 0 {
 		entries = wrapped.Packages
 	} else {

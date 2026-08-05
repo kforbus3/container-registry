@@ -1,6 +1,9 @@
 # Build a static single-binary registry. modernc.org/sqlite is pure Go, so the
 # image needs no libc and can run FROM scratch.
-FROM golang:1.26-alpine AS build
+# Base images are pinned by digest as well as tag: a tag is a moving pointer,
+# so without the digest the same commit can build against a different base
+# tomorrow. Dependabot proposes the bump when one moves.
+FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
 
 WORKDIR /src
 
@@ -17,7 +20,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
 
 # ------------------------------------------------------------------ runtime
 
-FROM alpine:3.20
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 RUN apk add --no-cache ca-certificates tzdata wget \
  && adduser -D -u 10001 -h /var/lib/registry registry \

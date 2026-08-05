@@ -20,18 +20,29 @@ func TestTokenRealmIsAbsolute(t *testing.T) {
 		host       string
 		tls        bool
 		headers    map[string]string
+		// trustProxy makes the request's peer a trusted proxy, which is what
+		// makes its forwarding headers believable.
+		trustProxy bool
 		want       string
 	}{
 		{name: "derived from the request", host: "registry.example:5000",
 			want: "http://registry.example:5000/token"},
 		{name: "https when the request is", host: "registry.example", tls: true,
 			want: "https://registry.example/token"},
-		{name: "honours a terminating proxy", host: "internal:5000",
-			headers: map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "reg.example"},
-			want:    "https://reg.example/token"},
+		{name: "honours a trusted terminating proxy", host: "internal:5000",
+			headers:    map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "reg.example"},
+			trustProxy: true,
+			want:       "https://reg.example/token"},
 		{name: "takes the first hop of a proxy chain", host: "internal:5000",
-			headers: map[string]string{"X-Forwarded-Proto": "https, http"},
-			want:    "https://internal:5000/token"},
+			headers:    map[string]string{"X-Forwarded-Proto": "https, http"},
+			trustProxy: true,
+			want:       "https://internal:5000/token"},
+		// Anyone can send these headers. Believing them from a caller that is
+		// not a declared proxy would let it choose the URL clients are told to
+		// fetch their credentials from.
+		{name: "ignores forwarding headers from an untrusted peer", host: "internal:5000",
+			headers: map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "evil.example"},
+			want:    "http://internal:5000/token"},
 		{name: "an absolute configured realm is used as-is",
 			configured: "https://auth.example/v2/token", host: "registry.example",
 			want: "https://auth.example/v2/token"},
@@ -41,7 +52,11 @@ func TestTokenRealmIsAbsolute(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Server{Cfg: &config.Config{TokenRealm: tc.configured}}
+			cfg := &config.Config{TokenRealm: tc.configured}
+			if tc.trustProxy {
+				cfg.TrustAllProxies = true
+			}
+			s := &Server{Cfg: cfg}
 			r := httptest.NewRequest(http.MethodGet, "/v2/", nil)
 			r.Host = tc.host
 			if tc.tls {
