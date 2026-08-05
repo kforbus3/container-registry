@@ -56,6 +56,8 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # Required on a private repository: the action reads its own workflow run.
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: github/codeql-action/init@v4
@@ -71,6 +73,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
 
@@ -98,9 +101,18 @@ jobs:
           output: trivy-config.sarif
           severity: CRITICAL,HIGH
 
-      - name: Upload results
+      # A separate upload per scan: code scanning stopped combining multiple
+      # runs under one category, and two scans in one directory is exactly that.
+      - name: Upload image findings
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: .
-          category: trivy
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload configuration findings
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
