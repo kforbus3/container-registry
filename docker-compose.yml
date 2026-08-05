@@ -55,6 +55,22 @@ services:
       REGISTRY_ANONYMOUS_PULL: ${REGISTRY_ANONYMOUS_PULL:-false}
       REGISTRY_LOG_LEVEL: ${REGISTRY_LOG_LEVEL:-info}
 
+      # Set this to your proxy's address, or a CIDR block covering it, when the
+      # registry sits behind one. Forwarding headers are ignored from anyone
+      # else, so without it every request is attributed to the proxy: the audit
+      # log records its address, and rate limiting and the failed-login throttle
+      # count every client as one caller.
+      #
+      # Leave it unset when the registry is exposed directly, which is what the
+      # published port above does.
+      REGISTRY_TRUSTED_PROXIES: ${REGISTRY_TRUSTED_PROXIES:-}
+
+      # Vulnerability scanning matches each generated SBOM against an OSV
+      # advisory service, which means outbound requests. Set it to false to keep
+      # SBOM generation but do no matching, or point REGISTRY_VULN_ENDPOINT at a
+      # mirror to keep the matching without the egress.
+      REGISTRY_VULN_SCAN: ${REGISTRY_VULN_SCAN:-true}
+
     volumes:
       - registry-data:/var/lib/registry
       # tls.crt must be the full chain: leaf first, then any intermediates.
