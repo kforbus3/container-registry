@@ -562,6 +562,18 @@ the version number. Findings are advisory matches, not exploitability
 judgements. A failed scan is recorded as failed and shown as such, because
 "could not check" must never render as "clean".
 
+**Turning it off.** Scanning is the only part of the registry that talks to
+anything outside it, so it is the one thing an air-gapped or egress-restricted
+deployment has to decide about:
+
+```bash
+REGISTRY_VULN_SCAN=false                        # keep SBOMs, do no matching
+REGISTRY_VULN_ENDPOINT=https://osv.internal     # or match against a mirror
+REGISTRY_SBOM=false                             # or generate no SBOMs at all
+```
+
+Each is independent: SBOM generation is local and works with scanning off.
+
 ---
 
 ## Token authentication
