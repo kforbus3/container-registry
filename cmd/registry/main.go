@@ -27,7 +27,20 @@ import (
 	"github.com/kforbus3/container-registry/internal/webhook"
 )
 
+// version is stamped at build time with -X main.version. The Makefile and the
+// Dockerfile both set it from `git describe`; a binary built any other way says
+// "dev", which is the honest answer.
+var version = "dev"
+
 func main() {
+	// Answering --version must not need a data directory or a database, so it
+	// is handled before anything is opened.
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-version" || arg == "-v" {
+			fmt.Println("container-registry", version)
+			return
+		}
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
@@ -37,6 +50,9 @@ func main() {
 func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(log)
+	// Logged at start-up as well, so a running instance can be identified from
+	// its logs without shelling into it.
+	log.Info("container registry starting", "version", version)
 
 	cfg, err := config.Load()
 	if err != nil {
