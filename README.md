@@ -254,6 +254,12 @@ All configuration is by environment variable.
 | `REGISTRY_AUTH_FAIL_THRESHOLD` | `5` | Failed authentications tolerated before waits begin; `0` disables |
 | `REGISTRY_AUTH_FAIL_WINDOW` | `15m` | How long a quiet caller keeps its failure count |
 | `REGISTRY_AUTH_LOCKOUT_MAX` | `15m` | Longest wait imposed on a persistent guesser |
+| `REGISTRY_TRUSTED_PROXIES` | — | Addresses or CIDRs whose `X-Forwarded-*` headers are believed; `*` trusts any peer |
+| `REGISTRY_TLS_MIN_VERSION` | `1.2` | Oldest TLS version accepted; `1.2` or `1.3` |
+| `REGISTRY_HSTS_MAX_AGE` | `8760h` | `Strict-Transport-Security` max-age over HTTPS; `0` omits the header |
+| `REGISTRY_HSTS_INCLUDE_SUBDOMAINS` | `false` | Add `includeSubDomains` |
+| `REGISTRY_HSTS_PRELOAD` | `false` | Add `preload` |
+| `REGISTRY_WEBHOOK_ALLOW_INTERNAL` | `false` | Deliver webhooks to loopback, link-local and private addresses |
 | `REGISTRY_S3_BUCKET` | — | Setting this moves blobs to an object store |
 | `REGISTRY_S3_ENDPOINT` | *(derived from region)* | `http://minio:9000`, or an AWS endpoint |
 | `REGISTRY_S3_REGION` | `us-east-1` | Signing region |
@@ -1120,6 +1126,10 @@ suite run.
 
 ## Security notes
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md), which also lists the
+behaviour that is deliberate rather than a defect, and a hardening checklist for
+a deployment that has to stand up to review.
+
 - Passwords are bcrypt-hashed. Token secrets carry 256 bits of entropy and are
   stored as SHA-256, compared in constant time; the plaintext is shown once.
 - Session cookies are `HttpOnly`, `SameSite=Strict`, and `Secure` when TLS is on.
@@ -1137,6 +1147,60 @@ suite run.
   blob store; a mismatch discards the upload.
 - Anonymous pull, when enabled, applies only to repositories explicitly marked
   public — it is not a blanket read grant.
+- Forwarding headers are believed only from a declared proxy, so the address in
+  the audit log is not caller-controlled.
+- Webhook deliveries refuse internal addresses, do not follow redirects, and
+  re-check the destination as the connection is opened.
+- The container runs as an unprivileged user with no capabilities and a
+  read-only root filesystem; CI proves it starts and serves a push that way.
+- CI runs `go vet`, `staticcheck`, `govulncheck` and Trivy against the source
+  and the built image, weekly as well as on every change; CodeQL is configured
+  and opt-in. See [SECURITY.md](SECURITY.md#what-ci-checks).
 
 Run it behind TLS. The `WWW-Authenticate: Basic` challenge that makes
 `docker login` work sends credentials base64-encoded, not encrypted.
+
+### Behind a reverse proxy
+
+`X-Forwarded-For`, `-Proto` and `-Host` are ignored unless the peer sending them
+is named in `REGISTRY_TRUSTED_PROXIES`. Anyone can send those headers, and
+believing them from an arbitrary caller lets it choose the address written to
+the audit log, the bucket its failed logins are counted against, and the URL
+clients are told to fetch credentials from.
+
+```bash
+REGISTRY_TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5   # addresses or CIDR blocks
+REGISTRY_TRUSTED_PROXIES='*'                      # any peer, if only the proxy can reach it
+```
+
+Unset — the default — the peer on the socket is the client, which is correct
+for direct exposure and wrong behind a proxy: every request will appear to come
+from the proxy. Set it to the proxy's address.
+
+`Strict-Transport-Security` is sent only over a connection that is already
+secure, directly or by a trusted proxy's `X-Forwarded-Proto`. Over plain HTTP it
+would be ignored by browsers anyway, and would be a lie on a registry
+deliberately run without TLS.
+
+### Response headers
+
+The web UI is served with a content security policy confining every fetch to
+this origin, with framing, plugins, `<base>` rewriting and cross-origin form
+posts refused outright. `script-src` still carries `'unsafe-inline'` because the
+UI wires its buttons with inline `onclick` attributes, which no nonce or hash
+covers — moving those to delegated listeners is what it would take to drop it.
+The policy is not applied to `/v2`, which serves no HTML.
+
+### Webhook destinations
+
+A webhook URL is written by an administrator but fetched by the registry, so a
+URL naming an address only the registry can reach — cloud metadata at
+`169.254.169.254`, a database admin port, anything on loopback — turns the
+registry into a way in. Delivery to loopback, link-local, private, shared and
+unique-local addresses is refused unless `REGISTRY_WEBHOOK_ALLOW_INTERNAL=true`,
+which is the setting for a receiver that genuinely lives on the private network.
+
+The address is checked twice: when the webhook is created, so a mistake is
+caught where it is made, and again as the connection is opened, which is the
+check a DNS answer cannot be raced past. Redirects are not followed — a receiver
+would otherwise be choosing the second destination itself.

@@ -96,6 +96,7 @@ func parseManifest(body []byte, contentType string) (*parsedManifest, error) {
 		}
 	}
 	if mt == MediaTypeDockerManifestV1 || mt == MediaTypeDockerManifestV1S {
+		//lint:ignore ST1005 the message names Docker, a proper noun, not a sentence start
 		return nil, fmt.Errorf("Docker manifest schema 1 is not supported; push with a modern client")
 	}
 	if !supportedManifestTypes[mt] {

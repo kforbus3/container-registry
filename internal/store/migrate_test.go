@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,16 +156,21 @@ func TestMigrateVerifiesDigests(t *testing.T) {
 	}
 }
 
-// gatedBackend blocks its first Put until gate is closed.
+// gatedBackend blocks its first Put until gate is closed. Every later Put runs
+// straight through — that asymmetry is the point, since the test writes
+// concurrently with a migration that is being held at its first copy.
+//
+// The flag is atomic because both goroutines reach this at once, which is the
+// situation the test exists to create. A sync.Once would be wrong here: it
+// would make the second caller wait for the first instead of passing it.
 type gatedBackend struct {
 	Backend
 	gate  chan struct{}
-	first bool
+	first atomic.Bool
 }
 
 func (g *gatedBackend) Put(ctx context.Context, key string, r io.Reader, size int64) error {
-	if !g.first {
-		g.first = true
+	if g.first.CompareAndSwap(false, true) {
 		<-g.gate
 	}
 	return g.Backend.Put(ctx, key, r, size)

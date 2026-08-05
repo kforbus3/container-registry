@@ -101,7 +101,7 @@ func (s *Server) rateKey(r *http.Request) string {
 		}
 		return fmt.Sprintf("user:%d", p.UserID)
 	}
-	return "ip:" + remoteIP(r)
+	return "ip:" + s.remoteIP(r)
 }
 
 // allowRequest applies the limit for this request, writing the response itself
@@ -240,13 +240,16 @@ func (s *Server) tokenRealm(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-		// Only the first value: a chain of proxies appends to this header.
-		scheme = strings.TrimSpace(strings.Split(p, ",")[0])
+	// Forwarding headers are read only from a proxy named in
+	// REGISTRY_TRUSTED_PROXIES: they decide the URL clients are sent to for
+	// their credentials, and taking them from anyone would let a caller point
+	// that at a host of their choosing.
+	if p := s.forwardedValue(r, "X-Forwarded-Proto"); p != "" {
+		scheme = p
 	}
 	host := r.Host
-	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-		host = strings.TrimSpace(strings.Split(h, ",")[0])
+	if h := s.forwardedValue(r, "X-Forwarded-Host"); h != "" {
+		host = h
 	}
 	if host == "" {
 		return realm
@@ -343,7 +346,7 @@ func (s *Server) resolvePrincipal(r *http.Request) (*auth.Principal, error) {
 // one host working through a list of accounts and many hosts working on one
 // account.
 func (s *Server) authKeys(r *http.Request) []string {
-	keys := []string{"ip:" + remoteIP(r)}
+	keys := []string{"ip:" + s.remoteIP(r)}
 	if user, _, ok := basicUser(r); ok && user != "" {
 		keys = append(keys, "user:"+strings.ToLower(user))
 	}
@@ -431,20 +434,70 @@ func (s *Server) authenticate(r *http.Request) (*auth.Principal, error) {
 	return nil, nil
 }
 
-// remoteIP extracts the client address, honouring X-Forwarded-For when the
-// registry sits behind a reverse proxy.
-func remoteIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, found := strings.Cut(xff, ","); found {
-			return strings.TrimSpace(first)
-		}
-		return strings.TrimSpace(xff)
+// remoteIP extracts the client address, honouring X-Forwarded-For only when the
+// peer sending it is a proxy named in REGISTRY_TRUSTED_PROXIES.
+//
+// The address is not cosmetic: it goes in the audit log, and it is the key a
+// caller's failed logins and rate limit are counted against. Taking it from a
+// header anyone may set would let a caller choose all three.
+func (s *Server) remoteIP(r *http.Request) string {
+	direct := directIP(r)
+	if !s.Cfg.Trusts(direct) {
+		// Nothing vouches for the headers, so the peer on the socket is the
+		// only address there is evidence for. Believing X-Forwarded-For from an
+		// arbitrary caller would let it pick the address in the audit log and
+		// the bucket its failed logins are counted against.
+		return direct
 	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return direct
+	}
+	// Read right to left. The rightmost entries were appended by proxies whose
+	// word we take; the first address that is not one of ours is as far back as
+	// the chain can be believed, and everything left of it is client-supplied.
+	parts := strings.Split(xff, ",")
+	leftmost := ""
+	for i := len(parts) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(parts[i])
+		if hop == "" {
+			continue
+		}
+		if !s.Cfg.Trusts(hop) {
+			return hop
+		}
+		leftmost = hop
+	}
+	// Every hop was a proxy we trust — which is always the case with a wildcard
+	// trust list. The leftmost is then the closest thing to a client there is;
+	// falling back to the peer here would report the nearest proxy instead.
+	if leftmost != "" {
+		return leftmost
+	}
+	return direct
+}
+
+// directIP is the peer on the socket, with no headers consulted.
+func directIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// forwardedValue reads the first entry of a forwarding header, but only from a
+// proxy this registry has been told to trust. A chain of proxies appends to
+// these, so the first value is the one nearest the client.
+func (s *Server) forwardedValue(r *http.Request, header string) string {
+	if !s.Cfg.Trusts(directIP(r)) {
+		return ""
+	}
+	v := r.Header.Get(header)
+	if v == "" {
+		return ""
+	}
+	return strings.TrimSpace(strings.Split(v, ",")[0])
 }
 
 // emit publishes a registry event to any subscribed webhooks. A nil dispatcher
@@ -462,7 +515,7 @@ func (s *Server) emit(r *http.Request, repoID int64, event, repo, reference, dig
 
 func (s *Server) audit(r *http.Request, action, repo, reference, detail string) {
 	p := principalFrom(r.Context())
-	s.DB.Audit(context.WithoutCancel(r.Context()), p.Display(), action, repo, reference, detail, remoteIP(r))
+	s.DB.Audit(context.WithoutCancel(r.Context()), p.Display(), action, repo, reference, detail, s.remoteIP(r))
 }
 
 // ---------------------------------------------------------------- routing
@@ -548,9 +601,38 @@ func (s *Server) refreshGauges(r *http.Request) {
 	}
 }
 
+// contentSecurityPolicy is served with the web UI.
+//
+// Everything the UI needs is served by this registry, so every fetch directive
+// is 'self' and the rest are shut off: no plugins, no <base> rewriting, no
+// framing, no form posting elsewhere. That closes the routes an injected string
+// would otherwise use to load or exfiltrate anything.
+//
+// script-src carries 'unsafe-inline' because the UI wires its buttons with
+// inline onclick attributes, which no nonce or hash can cover. Removing it
+// means moving those handlers to delegated listeners; until then the policy
+// still blocks a script from anywhere but this origin, which is what stops an
+// injected <script src> from reaching an attacker's host.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self' 'unsafe-inline'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; " +
+	"connect-src 'self'; " +
+	"font-src 'self'; " +
+	"object-src 'none'; " +
+	"base-uri 'none'; " +
+	"form-action 'self'; " +
+	"frame-ancestors 'none'"
+
 func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// HSTS is meaningful only over a connection that is already secure —
+		// sending it over plain HTTP is ignored by design, and would be a lie
+		// on a registry deliberately run without TLS.
+		if s.requestIsSecure(r) {
+			w.Header().Set("Strict-Transport-Security", s.Cfg.HSTSHeader())
+		}
 		if strings.HasPrefix(r.URL.Path, "/v2") {
 			// A legacy Docker header the OCI specification calls optional and
 			// tells clients not to depend on. It is emitted on the registry API
@@ -559,9 +641,22 @@ func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 		} else {
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "same-origin")
+			w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requestIsSecure reports whether the client reached the registry over TLS,
+// either directly or through a proxy this registry has been told to trust.
+func (s *Server) requestIsSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if proto := s.forwardedValue(r, "X-Forwarded-Proto"); proto != "" {
+		return strings.EqualFold(proto, "https")
+	}
+	return false
 }
 
 func (s *Server) withRecovery(next http.Handler) http.Handler {
@@ -616,7 +711,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 		// Static UI assets would drown out anything useful.
 		if r.URL.Path == "/" || r.URL.Path == "/token" ||
 			strings.HasPrefix(r.URL.Path, "/v2") || strings.HasPrefix(r.URL.Path, "/api") {
-			s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "status", sr.status, "ip", remoteIP(r))
+			s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "status", sr.status, "ip", s.remoteIP(r))
 		}
 	})
 }

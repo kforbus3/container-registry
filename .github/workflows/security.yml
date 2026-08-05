@@ -1,0 +1,112 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, because a dependency does not have to change for a new advisory
+    # to be published against the version already pinned here.
+    - cron: '19 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    name: Known vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # govulncheck reports only vulnerabilities in code paths this binary
+      # actually reaches, so a finding here is a finding about this registry
+      # rather than about something a dependency happens to contain.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  staticcheck:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+  # CodeQL uploads its results to code scanning, which on a private repository
+  # needs GitHub Advanced Security. Without it the analysis runs to completion
+  # and then fails at the upload, so the job is opt-in: set the repository
+  # variable ENABLE_CODEQL to "true" once code scanning is available (Settings →
+  # Code security), or when the repository is public, where it is free.
+  codeql:
+    name: CodeQL
+    if: vars.ENABLE_CODEQL == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      # Required on a private repository: the action reads its own workflow run.
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          queries: security-extended
+      - uses: github/codeql-action/autobuild@v4
+      - uses: github/codeql-action/analyze@v4
+
+  image:
+    name: Image and filesystem scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: docker build -t container-registry:scan .
+
+      # Findings fail the job and are printed in the log rather than uploaded as
+      # SARIF, which needs code scanning enabled. This works on any repository,
+      # and a failed job is a louder signal than an alert nobody opens.
+      #
+      # The image is scanned as well as the source: the base image contributes
+      # packages this repository never names, and they are as much a part of
+      # what gets deployed as the binary is.
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: container-registry:scan
+          format: table
+          severity: CRITICAL,HIGH
+          # An unfixed vulnerability is worth knowing about but cannot be acted
+          # on by upgrading, so it does not fail the build.
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan configuration and manifests
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'

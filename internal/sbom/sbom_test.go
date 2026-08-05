@@ -540,11 +540,15 @@ func TestEnqueueNeverBlocksWhenFull(t *testing.T) {
 
 func TestUUIDFromDigestIsStable(t *testing.T) {
 	d := store.Digest([]byte("some manifest"))
-	if uuidFromDigest(d) != uuidFromDigest(d) {
-		t.Fatal("serial number derivation is not stable")
+	// The same digest must always yield the same serial: a certificate serial
+	// that moved between runs would make two SBOMs of one image look like two
+	// different artifacts.
+	first, second := uuidFromDigest(d), uuidFromDigest(d)
+	if first != second {
+		t.Fatalf("serial number derivation is not stable: %q then %q", first, second)
 	}
-	if len(uuidFromDigest(d)) != 36 {
-		t.Fatalf("serial %q is not UUID-shaped", uuidFromDigest(d))
+	if len(first) != 36 {
+		t.Fatalf("serial %q is not UUID-shaped", first)
 	}
 }
 

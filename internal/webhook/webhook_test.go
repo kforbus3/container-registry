@@ -25,7 +25,9 @@ func newTestDispatcher(t *testing.T) (*Dispatcher, *db.DB) {
 	}
 	t.Cleanup(func() { database.Close() })
 
-	d := New(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 16, 2*time.Second)
+	// Test receivers are httptest servers on loopback, which delivery refuses by
+	// default — that refusal is what TestRefusesInternalDestinations covers.
+	d := NewWithOptions(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 16, 2*time.Second, true)
 	return d, database
 }
 

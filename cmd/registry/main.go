@@ -98,8 +98,9 @@ func run() error {
 	}
 
 	httpSrv := &http.Server{
-		Addr:    cfg.Addr,
-		Handler: srv.Handler(),
+		Addr:      cfg.Addr,
+		Handler:   srv.Handler(),
+		TLSConfig: tlsConfig(cfg),
 		// Blob uploads can be large and slow, so no global write timeout; the
 		// read header timeout still protects against slowloris connections.
 		ReadHeaderTimeout: 30 * time.Second,
@@ -113,11 +114,13 @@ func run() error {
 	// Webhooks are started first so everything below can emit into them.
 	var hooks *webhook.Dispatcher
 	if cfg.WebhooksEnabled {
-		hooks = webhook.New(database, log, cfg.WebhookQueue, cfg.WebhookTimeout)
+		hooks = webhook.NewWithOptions(database, log, cfg.WebhookQueue, cfg.WebhookTimeout,
+			cfg.WebhookAllowInternal)
 		hooks.Start(ctx, cfg.WebhookWorkers)
 		srv.SetWebhooks(hooks)
 		defer hooks.Wait()
-		log.Info("webhooks enabled", "workers", cfg.WebhookWorkers)
+		log.Info("webhooks enabled", "workers", cfg.WebhookWorkers,
+			"internal_destinations", cfg.WebhookAllowInternal)
 	}
 
 	// Vulnerability scanning consumes the SBOMs, so it is started first and
@@ -269,6 +272,24 @@ func openStore(ctx context.Context, database *db.DB, cfg *config.Config, log *sl
 		"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
 		"prefix", s3cfg.Prefix, "path_style", s3cfg.PathStyle)
 	return store.NewWithBackend(cfg.DataDir, cfg.MaxUploadBytes, backend)
+}
+
+// tlsConfig pins the floor rather than leaving it to the default, which moves
+// between Go releases. 1.2 is the floor because 1.3-only excludes clients that
+// are otherwise fine; set REGISTRY_TLS_MIN_VERSION=1.3 where the fleet allows.
+func tlsConfig(cfg *config.Config) *tls.Config {
+	min := uint16(tls.VersionTLS12)
+	if cfg.TLSMinVersion == "1.3" {
+		min = tls.VersionTLS13
+	}
+	return &tls.Config{
+		MinVersion: min,
+		// Go orders 1.2 suites by its own judgement of what is safe and fast on
+		// the running hardware, and ignores any preference expressed here for
+		// 1.3. Naming a list would freeze a decision that is better left to the
+		// runtime; what matters is that nothing below 1.2 is offered at all.
+		NextProtos: []string{"h2", "http/1.1"},
+	}
 }
 
 func logLevel() slog.Level {
