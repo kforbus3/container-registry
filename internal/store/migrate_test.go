@@ -94,10 +94,21 @@ func TestMigrateMirrorsConcurrentWrites(t *testing.T) {
 	// A target that blocks on its first write, holding the migration open
 	// long enough for a push to arrive mid-flight.
 	gate := make(chan struct{})
-	target := &gatedBackend{Backend: newFSBackend(t, "new"), gate: gate}
+	target := &gatedBackend{Backend: newFSBackend(t, "new"), gate: gate, held: make(chan struct{})}
 
 	if err := s.Migrate(context.Background(), target, nil); err != nil {
 		t.Fatalf("start: %v", err)
+	}
+
+	// Wait until the migration's copy is the write being held. Without this the
+	// push below could reach the target first -- its mirrored write then took the
+	// gate, and waited on a gate this goroutine only opens after the push returns.
+	// A deadlock, about one run in a few hundred, which is how CI met it: the
+	// store package timed out after 20 minutes on 2026-09-26.
+	select {
+	case <-target.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the migration never started copying")
 	}
 
 	mid, err := s.For("test/repo").PutBytes([]byte("pushed during the migration"))
@@ -167,10 +178,16 @@ type gatedBackend struct {
 	Backend
 	gate  chan struct{}
 	first atomic.Bool
+	// held is closed once the first Put is waiting on gate, so the test can
+	// write only after the migration's copy -- not its own write -- holds it.
+	held chan struct{}
 }
 
 func (g *gatedBackend) Put(ctx context.Context, key string, r io.Reader, size int64) error {
 	if g.first.CompareAndSwap(false, true) {
+		if g.held != nil {
+			close(g.held)
+		}
 		<-g.gate
 	}
 	return g.Backend.Put(ctx, key, r, size)
