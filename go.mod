@@ -3,7 +3,7 @@ module github.com/kforbus3/container-registry
 go 1.26.6
 
 require (
-	github.com/klauspost/compress v1.19.1
+	github.com/klauspost/compress v1.20.1
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.55.0
 )
